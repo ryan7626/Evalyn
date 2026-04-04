@@ -1,0 +1,24 @@
+[project]
+name = "evalyn"
+version = "0.1.0"
+description = "Overnight autonomous codebase testing and repair agent"
+requires-python = ">=3.10"
+dependencies = [
+    "click>=8.1",
+    "anthropic>=0.40",
+    "pyyaml>=6.0",
+    "rich>=13.0",
+]
+
+[project.scripts]
+evalyn = "evalyn.cli:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-cov"]
+
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
