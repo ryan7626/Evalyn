@@ -16,8 +16,24 @@ from evalyn.utils.log import get_console_logger
 console = Console()
 
 
+from evalyn.llm.openrouter_provider import OpenRouterProvider, OpenRouterProviderError
+import os
+
 def _create_llm(config):
     """Create the LLM provider based on config."""
+    if os.environ.get("OPENROUTER_API_KEY"):
+        try:
+            # OpenRouter model strings are typically prefixed with the provider
+            model = config.llm_model
+            if not ("/" in model):
+                model = "openai/gpt-4o-mini"
+                
+            console.print(f"[dim italic]Using OpenRouter ({model}) for LLM API calls.[/]")
+            return OpenRouterProvider(model=model)
+        except OpenRouterProviderError as e:
+            console.print(f"[bold red]OpenRouter error:[/] {e}")
+            raise SystemExit(1)
+            
     try:
         return ClaudeProvider(model=config.llm_model)
     except ClaudeProviderError as e:
