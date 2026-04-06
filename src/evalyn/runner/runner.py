@@ -18,7 +18,14 @@ from evalyn.runner.rollback import RollbackManager
 from evalyn.runner.test_executor import run_test_command
 from evalyn.services.manager import ServiceManager
 from evalyn.state import AgentState, save_state, get_latest_run_dir
-from evalyn.utils.git import create_branch, get_head_sha, get_current_branch
+from evalyn.utils.git import (
+    create_branch,
+    get_head_sha,
+    get_current_branch,
+    checkout_branch,
+    delete_branch,
+    reset_hard,
+)
 from evalyn.utils.log import get_logger, setup_logging
 
 logger = get_logger("runner")
@@ -125,6 +132,22 @@ def run_execution_phase(
             run_result.category_results.append(cat_result)
 
             logger.info(f"Category '{cat_name}': {cat_result.status.upper()}")
+
+    except BaseException as e:
+        # An unexpected exception or KeyboardInterrupt occurred.
+        # Ensure we discard the messy branch to return to target's clean original state.
+        logger.warning(f"Run aborted due to '{type(e).__name__}'. Rolling back strictly to '{original_branch}'...")
+        try:
+            reset_hard(config.repo_path)
+            checkout_branch(config.repo_path, original_branch)
+            delete_branch(config.repo_path, branch_name, force=True)
+            logger.info(f"Safely removed aborted branch '{branch_name}' and restored '{original_branch}'.")
+        except Exception as rollback_err:
+            logger.error(f"Failed to cleanly rollback branch during abort: {rollback_err}")
+            
+        state.last_run_status = "aborted"
+        save_state(config.repo_path, state)
+        raise e
 
     finally:
         # Always stop services we started

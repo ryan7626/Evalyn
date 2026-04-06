@@ -18,6 +18,9 @@ console = Console()
 
 from evalyn.llm.openrouter_provider import OpenRouterProvider, OpenRouterProviderError
 import os
+from dotenv import load_dotenv
+
+load_dotenv()
 
 def _create_llm(config):
     """Create the LLM provider based on config."""

@@ -6,6 +6,7 @@ Every function takes repo_path as its first argument.
 
 import subprocess
 from dataclasses import dataclass
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -62,6 +63,15 @@ def get_current_branch(repo_path: Path) -> str:
     return _run_git(repo_path, "rev-parse", "--abbrev-ref", "HEAD")
 
 
+def get_empty_tree_sha(repo_path: Path) -> str:
+    """Return the empty tree SHA, writing it to the object database if necessary.
+    
+    This ensures that diff operations against the empty tree will always succeed,
+    even if the object didn't previously exist in the repository.
+    """
+    return _run_git(repo_path, "hash-object", "-t", "tree", os.devnull, "-w")
+
+
 def get_head_sha(repo_path: Path) -> str:
     """Return the full SHA of HEAD."""
     return _run_git(repo_path, "rev-parse", "HEAD")
@@ -78,11 +88,19 @@ def get_commits_since(
     # Format: SHA|message|author|timestamp
     sep = "|||"
     fmt = f"%H{sep}%s{sep}%an{sep}%aI"
+    
+    # If since_sha is the empty tree hash, we want all commits from HEAD
+    empty_sha = get_empty_tree_sha(repo_path)
+    if since_sha == empty_sha:
+        range_arg = "HEAD"
+    else:
+        range_arg = f"{since_sha}..HEAD"
+
     output = _run_git(
         repo_path,
         "log",
         f"--format={fmt}",
-        f"{since_sha}..HEAD",
+        range_arg,
     )
 
     if not output:
@@ -155,6 +173,15 @@ def create_branch(repo_path: Path, name: str) -> None:
 def checkout_branch(repo_path: Path, name: str) -> None:
     """Checkout an existing branch."""
     _run_git(repo_path, "checkout", name)
+
+
+def delete_branch(repo_path: Path, name: str, force: bool = True) -> None:
+    """Delete an existing local branch.
+    
+    If force is True, uses -D. Otherwise, uses -d.
+    """
+    flag = "-D" if force else "-d"
+    _run_git(repo_path, "branch", flag, name)
 
 
 def stage_files(repo_path: Path, paths: list[str]) -> None:

@@ -14,6 +14,7 @@ from evalyn.utils.git import (
     get_changed_files,
     get_diff,
     get_head_sha,
+    get_empty_tree_sha,
 )
 from evalyn.utils.log import get_logger
 
@@ -72,7 +73,7 @@ def analyze_changes(
 
     # If no previous run, use git's empty tree SHA to capture everything
     if since_sha is None:
-        since_sha = _get_empty_tree_sha()
+        since_sha = get_empty_tree_sha(repo_path)
         logger.info("No previous run — analyzing all commits")
     else:
         logger.info(f"Analyzing changes since {since_sha[:8]}")
@@ -119,10 +120,3 @@ def _group_by_directory(files: list[str]) -> dict[str, list[str]]:
     return groups
 
 
-def _get_empty_tree_sha() -> str:
-    """Return git's well-known empty tree SHA.
-
-    This is a constant in git, representing an empty tree object.
-    Used as the 'since' ref when there's no previous run.
-    """
-    return "4b825dc642cb6eb9a060e54bf899d69f82cf7c06"

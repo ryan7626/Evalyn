@@ -70,12 +70,14 @@ Open the generated `plan.md` file.
 - To approve the plan, change `Status: PENDING` to `Status: APPROVED` inside the markdown file.
 
 ### 3. Run
-Execute the approved plan. Evalyn will create a new branch, start any necessary services, run the tests, and iterate using LLM-powered fixes if something fails.
+Execute the approved plan. Evalyn creates a separate, isolated branch for its workspace, starts any necessary services, runs tests, and applies iterative LLM-powered fixes if failures occur.
 
 ```bash
 evalyn run --repo /path/to/target/project
 ```
-Once completed, it drops a `report.md` (and `report.json`) into the run directory summarizing exactly what passed, what failed, and what lines it modified.
+
+- **On Success**: Once completed, the branch is retained. Evalyn drops a `report.md` summarizing exactly what passed, failed, and modified. You manually review and decide whether to merge the branch.
+- **On Abort**: If the run is cancelled (`Ctrl+C`) or crashes due to an unexpected error, Evalyn instantly initiates an atomic rollback. It cleans the worktree, safely deletes its messy branch, and restores you exactly back to the main branch you started on. Your `plan.md` remains perfectly intact on your main branch for a flawless restart!
 
 ### Check Status
 At any point, to see what Evalyn is currently doing or check the results of the last run:
