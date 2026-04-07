@@ -52,7 +52,16 @@ PLAN_TEMPLATE = """\
 
 Status: PENDING
 
-<!-- Optional: add comments or notes below -->
+---
+
+## User Notes
+
+<!-- Add directives below to control which categories run. -->
+<!-- Examples (remove the comment markers to activate): -->
+<!-- ONLY RUN UI Enhancements, Photo Upload Functionality -->
+<!-- SKIP Spatial Detection Fixes -->
+<!-- MAX CATEGORIES 2 -->
+<!-- You can also change any category header from [REQUIRED] to [SKIP] above. -->
 """
 
 CATEGORY_TEMPLATE = """\

@@ -16,7 +16,7 @@ class CategoryResult:
     """Aggregated result for a single test category."""
 
     name: str
-    status: Literal["passed", "failed", "uncertain"]
+    status: Literal["passed", "failed", "uncertain", "skipped"]
     test_results: list[TestResult] = field(default_factory=list)
     fix_attempts: list[FixAttempt] = field(default_factory=list)
     error_message: str = ""
@@ -43,3 +43,7 @@ class RunResult:
     @property
     def uncertain_count(self) -> int:
         return sum(1 for c in self.category_results if c.status == "uncertain")
+
+    @property
+    def skipped_count(self) -> int:
+        return sum(1 for c in self.category_results if c.status == "skipped")

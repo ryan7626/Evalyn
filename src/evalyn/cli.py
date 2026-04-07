@@ -114,7 +114,19 @@ def plan(repo: Path):
     default=".",
     help="Path to the target repository (default: current directory).",
 )
-def run(repo: Path):
+@click.option(
+    "--category",
+    "categories",
+    multiple=True,
+    help="Run only the named category (repeatable). Overrides plan directives.",
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    default=False,
+    help="Parse the plan and show what would run without executing.",
+)
+def run(repo: Path, categories: tuple[str, ...], dry_run: bool):
     """Execute the approved test plan."""
     repo = validate_repo(repo)
     logger = get_console_logger("run")
@@ -130,9 +142,17 @@ def run(repo: Path):
 
     llm = _create_llm(config)
 
-    result = run_execution_phase(config, state, llm)
+    category_filter = list(categories) if categories else None
+    result = run_execution_phase(
+        config, state, llm,
+        category_filter=category_filter,
+        dry_run=dry_run,
+    )
 
     if result is None:
+        if dry_run:
+            console.print("\n[bold green]Dry run complete.[/] No tests were executed.")
+            return
         console.print(
             "\n[bold red]Run could not start.[/] "
             "Check the errors above."
@@ -145,6 +165,7 @@ def run(repo: Path):
         f"  ✅ Passed:    {result.passed_count}\n"
         f"  ❌ Failed:    {result.failed_count}\n"
         f"  ❓ Uncertain: {result.uncertain_count}\n"
+        f"  ⏭️  Skipped:   {result.skipped_count}\n"
         f"  ⏱️  Duration:  {result.total_duration_seconds:.1f}s"
     )
     console.print(

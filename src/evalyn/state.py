@@ -17,7 +17,7 @@ class AgentState:
 
     last_run_commit: Optional[str] = None
     last_run_timestamp: Optional[str] = None
-    last_run_status: Optional[str] = None  # "completed" | "failed" | "in_progress"
+    last_run_status: Optional[str] = None  # "completed" | "in_progress" | "aborted" | "recovered"
     current_branch: Optional[str] = None
     run_history: list[dict] = field(default_factory=list)
 
@@ -107,3 +107,11 @@ def is_run_in_progress(repo_path: Path) -> bool:
     """Check if a run was interrupted (status is 'in_progress')."""
     state = load_state(repo_path)
     return state.last_run_status == "in_progress"
+
+
+def reset_state(repo_path: Path) -> None:
+    """Reset agent state to defaults.
+
+    Writes a fresh AgentState to disk, clearing all run history and branch info.
+    """
+    save_state(repo_path, AgentState())

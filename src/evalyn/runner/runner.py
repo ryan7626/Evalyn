@@ -24,6 +24,7 @@ from evalyn.utils.git import (
     get_current_branch,
     checkout_branch,
     delete_branch,
+    branch_exists,
     reset_hard,
 )
 from evalyn.utils.log import get_logger, setup_logging
@@ -35,6 +36,9 @@ def run_execution_phase(
     config: Config,
     state: AgentState,
     llm: BaseLLM,
+    *,
+    category_filter: Optional[list[str]] = None,
+    dry_run: bool = False,
 ) -> Optional[RunResult]:
     """Execute the full run phase.
 
@@ -77,18 +81,47 @@ def run_execution_phase(
     logger.info("Plan approved — starting execution phase")
 
     # Parse categories from the approved plan
-    categories = _parse_plan_categories(plan_path)
-    if not categories:
+    all_categories = _parse_plan_categories(plan_path)
+    if not all_categories:
         logger.error("No test categories found in the approved plan.")
         return None
 
-    logger.info(f"Found {len(categories)} categories to execute")
+    # Parse user notes for directives
+    user_directives = _parse_user_notes(plan_path)
+
+    # Apply filtering: CLI --category > user notes > default (all REQUIRED)
+    categories, skipped = _apply_category_filters(
+        all_categories,
+        cli_filter=category_filter,
+        directives=user_directives,
+    )
+
+    if not categories and not skipped:
+        logger.error("No executable categories after applying filters.")
+        return None
+
+    logger.info(f"Categories to execute: {len(categories)}")
+    for name, _ in categories:
+        logger.info(f"  ▶ {name}")
+    if skipped:
+        logger.info(f"Categories skipped: {len(skipped)}")
+        for name, reason in skipped:
+            logger.info(f"  ⏭ {name} — {reason}")
+
+    # Dry run: print what would happen and exit
+    if dry_run:
+        logger.info("Dry run — no branch created, no tests executed.")
+        return None
 
     # Create a new branch for this run
     timestamp = run_dir.name
     branch_name = f"evalyn/{timestamp}"
 
     original_branch = get_current_branch(config.repo_path)
+
+    # Pre-flight: detect and recover from stale state
+    _recover_stale_state(config.repo_path, state, branch_name, original_branch)
+
     create_branch(config.repo_path, branch_name)
     logger.info(f"Created branch: {branch_name}")
 
@@ -113,6 +146,14 @@ def run_execution_phase(
         branch=branch_name,
         run_dir=run_dir,
     )
+
+    # Record skipped categories in the result
+    for skip_name, skip_reason in skipped:
+        run_result.category_results.append(CategoryResult(
+            name=skip_name,
+            status="skipped",
+            error_message=skip_reason,
+        ))
 
     try:
         for cat_name, cat_commands in categories:
@@ -175,6 +216,7 @@ def run_execution_phase(
         "passed": run_result.passed_count,
         "failed": run_result.failed_count,
         "uncertain": run_result.uncertain_count,
+        "skipped": run_result.skipped_count,
         "duration_seconds": round(run_result.total_duration_seconds, 1),
     })
     save_state(config.repo_path, state)
@@ -286,29 +328,26 @@ def _execute_category(
     return cat_result
 
 
-def _parse_plan_categories(plan_path: Path) -> list[tuple[str, list[str]]]:
+def _parse_plan_categories(plan_path: Path) -> list[tuple[str, list[str], str]]:
     """Parse test categories and their commands from a plan.md file.
 
-    Returns list of (category_name, [commands]).
+    Returns list of (category_name, [commands], priority).
+    Priority is one of: 'required', 'optional', 'skip'.
     """
     content = plan_path.read_text(encoding="utf-8")
     categories = []
 
-    # Match category headers: ### [REQUIRED] Category Name or ### [OPTIONAL] Category Name
+    # Match category headers: ### [REQUIRED|OPTIONAL|SKIP] Category Name
     category_pattern = re.compile(
-        r"^###\s+\[(REQUIRED|OPTIONAL)\]\s+(.+)$",
-        re.MULTILINE,
+        r"^###\s+\[(REQUIRED|OPTIONAL|SKIP)\]\s+(.+)$",
+        re.MULTILINE | re.IGNORECASE,
     )
 
     matches = list(category_pattern.finditer(content))
 
     for i, match in enumerate(matches):
-        priority = match.group(1)
+        priority = match.group(1).lower()
         name = match.group(2).strip()
-
-        # Only execute REQUIRED categories
-        if priority.upper() != "REQUIRED":
-            continue
 
         # Extract section content between this match and the next
         start = match.end()
@@ -326,10 +365,153 @@ def _parse_plan_categories(plan_path: Path) -> list[tuple[str, list[str]]]:
                 if not cmd.startswith("/") and not cmd.startswith("src/"):
                     commands.append(cmd)
 
-        if commands:
-            categories.append((name, commands))
+        categories.append((name, commands, priority))
 
     return categories
+
+
+def _parse_user_notes(plan_path: Path) -> dict:
+    """Parse the User Notes section for actionable directives.
+
+    Supported directives:
+      ONLY RUN <category>[, <category2>, ...]
+      SKIP <category>
+      MAX CATEGORIES <N>
+
+    Returns a dict with keys: 'only_run', 'skip', 'max_categories'.
+    """
+    content = plan_path.read_text(encoding="utf-8")
+    directives: dict = {
+        "only_run": [],
+        "skip": [],
+        "max_categories": None,
+    }
+
+    # Find content after "Status: APPROVED" or "## User Notes"
+    notes_start = None
+    for marker in ["## User Notes", "Status: APPROVED"]:
+        idx = content.lower().find(marker.lower())
+        if idx != -1:
+            notes_start = idx + len(marker)
+            break
+
+    if notes_start is None:
+        return directives
+
+    notes_section = content[notes_start:]
+
+    for line in notes_section.split("\n"):
+        stripped = line.strip()
+        # Skip HTML comments and empty lines
+        if not stripped or stripped.startswith("<!--"):
+            continue
+
+        upper = stripped.upper()
+
+        # ONLY RUN <name>, <name2>
+        if upper.startswith("ONLY RUN "):
+            names_str = stripped[len("ONLY RUN "):]
+            names = [n.strip() for n in names_str.split(",") if n.strip()]
+            directives["only_run"].extend(names)
+            logger.info(f"User directive: ONLY RUN {names}")
+
+        # SKIP <name>
+        elif upper.startswith("SKIP "):
+            name = stripped[len("SKIP "):].strip()
+            if name:
+                directives["skip"].append(name)
+                logger.info(f"User directive: SKIP {name}")
+
+        # MAX CATEGORIES <N>
+        elif upper.startswith("MAX CATEGORIES "):
+            try:
+                n = int(stripped[len("MAX CATEGORIES "):])
+                directives["max_categories"] = n
+                logger.info(f"User directive: MAX CATEGORIES {n}")
+            except ValueError:
+                logger.warning(f"Invalid MAX CATEGORIES value: {stripped}")
+
+    return directives
+
+
+def _apply_category_filters(
+    all_categories: list[tuple[str, list[str], str]],
+    *,
+    cli_filter: Optional[list[str]] = None,
+    directives: Optional[dict] = None,
+) -> tuple[list[tuple[str, list[str]]], list[tuple[str, str]]]:
+    """Filter categories based on CLI flags, user notes, and plan markers.
+
+    Priority order:
+      1. CLI --category filter (highest priority)
+      2. User notes directives (ONLY RUN, SKIP, MAX CATEGORIES)
+      3. Plan markers ([SKIP] header, [OPTIONAL] excluded by default)
+
+    Args:
+        all_categories: Parsed categories as (name, commands, priority).
+        cli_filter: Category names from --category CLI flag.
+        directives: Parsed user notes directives dict.
+
+    Returns:
+        Tuple of:
+          - categories to execute: list of (name, commands)
+          - skipped categories: list of (name, reason)
+    """
+    if directives is None:
+        directives = {"only_run": [], "skip": [], "max_categories": None}
+
+    to_execute: list[tuple[str, list[str]]] = []
+    skipped: list[tuple[str, str]] = []
+
+    # Normalize names for case-insensitive matching
+    cli_names = [n.lower() for n in (cli_filter or [])]
+    only_run_names = [n.lower() for n in directives.get("only_run", [])]
+    skip_names = [n.lower() for n in directives.get("skip", [])]
+
+    for name, commands, priority in all_categories:
+        name_lower = name.lower()
+
+        # 1. [SKIP] in header — always skip
+        if priority == "skip":
+            skipped.append((name, "[SKIP] marker in plan"))
+            continue
+
+        # 2. CLI --category filter takes highest priority
+        if cli_names:
+            if name_lower in cli_names:
+                to_execute.append((name, commands))
+            else:
+                skipped.append((name, "not in --category filter"))
+            continue
+
+        # 3. ONLY RUN directive — if present, only named categories run
+        if only_run_names:
+            if name_lower in only_run_names:
+                to_execute.append((name, commands))
+            else:
+                skipped.append((name, "not in ONLY RUN directive"))
+            continue
+
+        # 4. SKIP directive — skip named categories
+        if name_lower in skip_names:
+            skipped.append((name, "SKIP directive in user notes"))
+            continue
+
+        # 5. Default: only execute REQUIRED categories
+        if priority == "required":
+            to_execute.append((name, commands))
+        else:
+            skipped.append((name, f"[{priority.upper()}] — not required"))
+
+    # 6. Apply MAX CATEGORIES limit
+    max_cats = directives.get("max_categories")
+    if max_cats is not None and len(to_execute) > max_cats:
+        overflow = to_execute[max_cats:]
+        to_execute = to_execute[:max_cats]
+        for name, _ in overflow:
+            skipped.append((name, f"exceeded MAX CATEGORIES {max_cats}"))
+
+    return to_execute, skipped
 
 
 def _extract_files_for_category(plan_path: Path, category_name: str) -> list[str]:
@@ -342,8 +524,8 @@ def _extract_files_for_category(plan_path: Path, category_name: str) -> list[str
 
     # Find the category section
     pattern = re.compile(
-        rf"###\s+\[(?:REQUIRED|OPTIONAL)\]\s+{re.escape(category_name)}",
-        re.MULTILINE,
+        rf"###\s+\[(?:REQUIRED|OPTIONAL|SKIP)\]\s+{re.escape(category_name)}",
+        re.MULTILINE | re.IGNORECASE,
     )
     match = pattern.search(content)
     if not match:

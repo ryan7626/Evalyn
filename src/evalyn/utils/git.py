@@ -184,6 +184,20 @@ def delete_branch(repo_path: Path, name: str, force: bool = True) -> None:
     _run_git(repo_path, "branch", flag, name)
 
 
+def branch_exists(repo_path: Path, name: str) -> bool:
+    """Check if a local branch exists."""
+    output = _run_git(repo_path, "branch", "--list", name)
+    return bool(output.strip())
+
+
+def list_branches(repo_path: Path, pattern: str = "evalyn/*") -> list[str]:
+    """List local branches matching a glob pattern."""
+    output = _run_git(repo_path, "branch", "--list", pattern, check=False)
+    if not output:
+        return []
+    return [b.strip().lstrip("* ") for b in output.split("\n") if b.strip()]
+
+
 def stage_files(repo_path: Path, paths: list[str]) -> None:
     """Stage specific files (git add)."""
     if not paths:
