@@ -201,3 +201,81 @@ def status(repo: Path):
     console.print(f"  Agent branch:   {state.current_branch or 'n/a'}")
     console.print(f"  Total runs:     {len(state.run_history)}")
     console.print()
+
+
+@main.command()
+@click.option(
+    "--repo",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    default=".",
+    help="Path to the target repository (default: current directory).",
+)
+@click.option(
+    "--all",
+    "clean_all",
+    is_flag=True,
+    default=False,
+    help="Remove all evalyn/* branches and reset agent state.",
+)
+@click.option(
+    "--force",
+    is_flag=True,
+    default=False,
+    help="Skip confirmation prompt.",
+)
+def clean(repo: Path, clean_all: bool, force: bool):
+    """Clean up stale evalyn branches and reset agent state."""
+    repo = validate_repo(repo)
+
+    from evalyn.utils.git import (
+        list_branches,
+        get_current_branch,
+        checkout_branch,
+        delete_branch,
+        reset_hard,
+    )
+    from evalyn.state import reset_state
+
+    branches = list_branches(repo, "evalyn/*")
+    state = load_state(repo)
+
+    if not branches and state.last_run_status not in ("in_progress", "aborted"):
+        console.print("\n[bold green]Nothing to clean.[/] No stale branches found.")
+        return
+
+    # Show what we found
+    console.print("\n[bold]Evalyn Cleanup[/]")
+    console.print(f"  Repository: {repo}")
+    if branches:
+        console.print(f"  Stale branches ({len(branches)}):")
+        for b in branches:
+            console.print(f"    • {b}")
+    if state.last_run_status in ("in_progress", "aborted"):
+        console.print(f"  State: [yellow]{state.last_run_status}[/] (will be reset)")
+
+    if not clean_all:
+        console.print("\n[dim]Use --all to remove all branches and reset state.[/]")
+        return
+
+    # Confirm
+    if not force:
+        click.confirm("\nProceed with cleanup?", abort=True)
+
+    # Clean branches
+    current = get_current_branch(repo)
+    deleted = 0
+    for b in branches:
+        try:
+            if current == b:
+                reset_hard(repo)
+                checkout_branch(repo, "main")
+                current = "main"
+            delete_branch(repo, b, force=True)
+            deleted += 1
+            console.print(f"  [red]✗[/] Deleted branch: {b}")
+        except Exception as e:
+            console.print(f"  [yellow]⚠[/] Could not delete {b}: {e}")
+
+    # Reset state
+    reset_state(repo)
+    console.print(f"\n[bold green]Cleanup complete.[/] Deleted {deleted} branch(es), state reset.")

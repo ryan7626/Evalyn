@@ -542,3 +542,53 @@ def _extract_files_for_category(plan_path: Path, category_name: str) -> list[str
             files.extend(file_matches)
 
     return files
+
+
+def _recover_stale_state(
+    repo_path: Path,
+    state: AgentState,
+    target_branch: str,
+    fallback_branch: str,
+) -> None:
+    """Detect and recover from stale state before creating a new branch.
+
+    Handles two cases:
+      1. state.json stuck at 'in_progress' from a killed process
+      2. A branch named `target_branch` already exists (from a previous run)
+
+    Args:
+        repo_path: Target repository path.
+        state: Current agent state (will be mutated and saved if recovered).
+        target_branch: The branch name we're about to create.
+        fallback_branch: The branch to checkout if we need to clean up.
+    """
+    # Case 1: Orphaned in_progress state
+    if state.last_run_status == "in_progress":
+        logger.warning(
+            f"Previous run was interrupted (status: in_progress). "
+            f"Cleaning up stale branch '{state.current_branch}'..."
+        )
+        stale_branch = state.current_branch
+        if stale_branch and branch_exists(repo_path, stale_branch):
+            current = get_current_branch(repo_path)
+            if current == stale_branch:
+                reset_hard(repo_path)
+                checkout_branch(repo_path, fallback_branch)
+            delete_branch(repo_path, stale_branch, force=True)
+            logger.info(f"Deleted orphaned branch '{stale_branch}'")
+
+        state.last_run_status = "recovered"
+        state.current_branch = None
+        save_state(repo_path, state)
+
+    # Case 2: Target branch already exists (stale from a completed/aborted run)
+    if branch_exists(repo_path, target_branch):
+        logger.warning(
+            f"Stale branch '{target_branch}' already exists. Removing it..."
+        )
+        current = get_current_branch(repo_path)
+        if current == target_branch:
+            reset_hard(repo_path)
+            checkout_branch(repo_path, fallback_branch)
+        delete_branch(repo_path, target_branch, force=True)
+        logger.info(f"Removed stale branch '{target_branch}'")
