@@ -1,8 +1,8 @@
 # Evalyn
 
-Evalyn is a local autonomous overnight codebase testing and repair agent for monorepos.
+Evalyn is a safety-first local autonomous codebase testing and bounded autoresearch repair agent for monorepos.
 
-It acts as a careful implementation partner: you code during the day, configure Evalyn to plan tests before you log off, approve the plan, and let it run overnight. By morning, Evalyn will have tested your changes, attempted atomic fixes for failures, and produced a detailed report — all on a safely isolated branch without making unapproved commits.
+It acts as a careful implementation partner: you code during the day, configure Evalyn to plan tests before you log off, approve the plan, and let it run overnight. By morning, Evalyn will have tested your changes, generated and evaluated multiple bounded repair hypotheses for any failures, applied the safest candidate, and produced a detailed report — all on a safely isolated branch without making unapproved commits or drifting beyond the approved execution scope.
 
 ---
 
@@ -11,7 +11,8 @@ It acts as a careful implementation partner: you code during the day, configure 
 - **LLM-Powered Categorization:** Reads your git diffs and infers logical test categories using Claude.
 - **Workflow-Driven Execution:** Enforces a manual planning and approval phase to ensure it only tests what you actually want tested.
 - **Safe Iteration:** Always works on a new, isolated branch named per run (e.g., `evalyn/2026-04-04`).
-- **Atomic Rollback:** Fixes are attempted one at a time and automatically snapshotted via `.patch` files. If a fix fails, it rolls back gracefully.
+- **Multi-Hypothesis Repair Loop:** Instead of single-shot guesses, Evalyn explores a bounded subset of repair hypotheses, scoring candidates on plan compliance and regression avoidance before retaining the safest fix.
+- **Atomic Rollback:** Failed experiments and losing repair candidates are cleanly reverted via internal `.patch` snapshots.
 - **Zero Auto-Commits:** Evalyn never commits code. All fixes are left unstaged for your manual review in the morning.
 - **Context-Aware:** Uses the target repository's own `CLAUDE.md` file as the single source of truth for the stack, rules, and commands.
 
@@ -37,14 +38,18 @@ pip install -e .
 ## Configuration
 
 ### 1. Set your API Key
-Copy the `.env.example` file to create your own `.env` and provide your Anthropic API Key:
+Copy the `.env.example` file to create your own `.env` and provide your API Key:
 
 ```bash
 cp .env.example .env
 ```
 Ensure you have exported the key to your shell environment before running Evalyn:
 ```bash
+# For Anthropic (Claude)
 export ANTHROPIC_API_KEY="your-api-key"
+
+# OR for OpenRouter (e.g. openai/gpt-4o-mini)
+export OPENROUTER_API_KEY="your-api-key"
 ```
 
 ### 2. Configure the Target Repository
@@ -114,4 +119,4 @@ Evalyn is bound by rigid safety protocols:
 - It **cannot** modify environment variables or secret files (`.env`).
 - It **will not** auto-commit changes.
 - It operates safely on a standalone branch.
-- It halts testing on the first blocking error, attempts a targeted fix, and will flag as "uncertain" if the fix fails rather than brute-forcing code modifications.
+- It halts testing on the first blocking error, explores bounded repair candidates instead of brute-forcing code modifications, and flags the issue as "uncertain" if no safe candidate survives fitness scoring.
