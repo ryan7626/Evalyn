@@ -238,5 +238,5 @@ def apply_patch(repo_path: Path, patch_path: Path) -> None:
 def reset_hard(repo_path: Path) -> None:
     """Reset the working tree to HEAD (git reset --hard HEAD)."""
     _run_git(repo_path, "reset", "--hard", "HEAD")
-    # Also clean untracked files that the agent may have created
-    _run_git(repo_path, "clean", "-fd")
+    # Also clean untracked files that the agent may have created, while protecting target state
+    _run_git(repo_path, "clean", "-fd", "-e", ".agent/")

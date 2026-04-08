@@ -25,6 +25,9 @@ class FixAttempt:
     explanation: str
     applied: bool = False
     rejected_reason: Optional[str] = None
+    passed: bool = False
+    diff_size: int = 0
+    is_best_candidate: bool = False
 
 
 SYSTEM_PROMPT = """\
@@ -43,6 +46,7 @@ Rules:
 - Your fix must be a search-and-replace: provide the exact text to find and the exact replacement.
 - If you are not confident in the fix, say so in the explanation.
 - If the failure seems to be an environment issue (not a code bug), explain that and provide no fix.
+- Simpler is better. A minimal modification that resolves the failure is preferred.
 """
 
 USER_PROMPT_TEMPLATE = """\
@@ -50,6 +54,7 @@ USER_PROMPT_TEMPLATE = """\
 
 {claude_md_content}
 
+{history_context}
 ## Failed Test
 
 - **Category**: {category}
@@ -105,7 +110,7 @@ FORBIDDEN_PATTERNS = [
 ]
 
 
-def attempt_fix(
+def generate_fix(
     llm: BaseLLM,
     repo_path: Path,
     category: str,
@@ -115,8 +120,9 @@ def attempt_fix(
     stderr: str,
     claude_md_content: str,
     relevant_files: list[str],
+    previous_attempts_context: str = "",
 ) -> FixAttempt:
-    """Ask the LLM for a fix and apply it if valid.
+    """Ask the LLM for a fix hypothesis.
 
     Args:
         llm: LLM provider.
@@ -128,15 +134,21 @@ def attempt_fix(
         stderr: Captured stderr.
         claude_md_content: Content of CLAUDE.md.
         relevant_files: List of relative file paths that may be related.
+        previous_attempts_context: Information about prior failed fix attempts in this loop.
 
     Returns:
-        FixAttempt with details of what was attempted.
+        FixAttempt with details of what was suggested.
     """
     # Read relevant source files
     source_files_content = _read_source_files(repo_path, relevant_files)
 
+    history_str = ""
+    if previous_attempts_context:
+        history_str = f"## Previous Failed Attempts\n\n{previous_attempts_context}\n"
+
     user_prompt = USER_PROMPT_TEMPLATE.format(
         claude_md_content=claude_md_content,
+        history_context=history_str,
         category=category,
         command=command,
         exit_code=exit_code,
@@ -168,12 +180,11 @@ def attempt_fix(
 
 
 def _process_fix_response(response: dict, repo_path: Path) -> FixAttempt:
-    """Validate and apply the LLM's suggested fix."""
+    """Validate the LLM's suggested fix without applying it yet."""
     file_path = response.get("file_path")
     original = response.get("original_content")
     replacement = response.get("replacement_content")
     explanation = response.get("explanation", "")
-    confidence = response.get("confidence", "low")
 
     # No fix suggested
     if file_path is None or original is None:
@@ -192,6 +203,7 @@ def _process_fix_response(response: dict, repo_path: Path) -> FixAttempt:
         original_content=original,
         replacement_content=replacement,
         explanation=explanation,
+        diff_size=abs(len(replacement or "") - len(original or ""))
     )
 
     # Safety checks
@@ -199,33 +211,40 @@ def _process_fix_response(response: dict, repo_path: Path) -> FixAttempt:
     if rejection:
         fix.rejected_reason = rejection
         fix.applied = False
-        logger.warning(f"Fix rejected: {rejection}")
-        return fix
+        logger.warning(f"Fix validation rejected: {rejection}")
 
-    # Apply the fix
-    full_path = repo_path / file_path
+    return fix
+
+
+def apply_fix(fix: FixAttempt, repo_path: Path) -> bool:
+    """Apply the validated fix to the filesystem.
+    
+    Returns:
+        True if successfully applied, False otherwise.
+    """
+    if fix.rejected_reason:
+        return False
+
+    full_path = repo_path / fix.file_path
     try:
         content = full_path.read_text(encoding="utf-8")
-        if original not in content:
+        if fix.original_content not in content:
             fix.rejected_reason = "Original content not found in file"
             fix.applied = False
-            logger.warning(f"Fix rejected: original content not found in {file_path}")
-            return fix
+            logger.warning(f"Fix rejected: original content not found in {fix.file_path}")
+            return False
 
-        new_content = content.replace(original, replacement, 1)
+        new_content = content.replace(fix.original_content, fix.replacement_content, 1)
         full_path.write_text(new_content, encoding="utf-8")
         fix.applied = True
-        logger.info(
-            f"Fix applied to {file_path} "
-            f"(confidence: {confidence}): {explanation}"
-        )
+        logger.info(f"Fix applied to {fix.file_path}: {fix.explanation}")
+        return True
 
     except OSError as e:
         fix.rejected_reason = f"File I/O error: {e}"
         fix.applied = False
         logger.error(f"Failed to apply fix: {e}")
-
-    return fix
+        return False
 
 
 def _validate_fix(fix: FixAttempt, repo_path: Path) -> Optional[str]:

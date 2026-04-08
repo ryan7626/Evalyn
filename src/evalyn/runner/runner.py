@@ -13,7 +13,7 @@ from evalyn.config import Config
 from evalyn.llm.base import BaseLLM
 from evalyn.models import CategoryResult, RunResult
 from evalyn.planner.planner import check_plan_approved
-from evalyn.runner.fixer import attempt_fix
+from evalyn.runner.fixer import generate_fix, apply_fix
 from evalyn.runner.rollback import RollbackManager
 from evalyn.runner.test_executor import run_test_command
 from evalyn.services.manager import ServiceManager
@@ -118,6 +118,15 @@ def run_execution_phase(
     branch_name = f"evalyn/{timestamp}"
 
     original_branch = get_current_branch(config.repo_path)
+    if original_branch == branch_name:
+        # We started exactly on the branch we're trying to recreate
+        # Fall back to main/master to prevent infinite branching loops
+        try:
+            checkout_branch(config.repo_path, "main")
+            original_branch = "main"
+        except Exception:
+            checkout_branch(config.repo_path, "master")
+            original_branch = "master"
 
     # Pre-flight: detect and recover from stale state
     _recover_stale_state(config.repo_path, state, branch_name, original_branch)
@@ -262,35 +271,44 @@ def _execute_category(
         logger.warning(f"Test failed: {command}")
 
         fixed = False
+        previous_attempts_context = ""
+        base_test_result = test_result  # Keep original baseline test output
+        
+        # Bounded Autoresearch Loop
         for attempt_num in range(1, config.max_fix_retries + 1):
             logger.info(
-                f"Fix attempt {attempt_num}/{config.max_fix_retries} "
+                f"Fix attempt hypothesis {attempt_num}/{config.max_fix_retries} "
                 f"for '{category_name}'"
             )
 
             # Snapshot before fix
             rollback.create_snapshot(f"pre_fix_{category_name}_{attempt_num}")
 
-            # Ask LLM for a fix
-            fix = attempt_fix(
+            # Ask LLM for a fix hypothesis
+            fix = generate_fix(
                 llm=llm,
                 repo_path=repo_path,
                 category=category_name,
                 command=command,
-                exit_code=test_result.exit_code,
-                stdout=test_result.stdout,
-                stderr=test_result.stderr,
+                exit_code=base_test_result.exit_code,
+                stdout=base_test_result.stdout,
+                stderr=base_test_result.stderr,
                 claude_md_content=config.claude_md_content,
                 relevant_files=relevant_files,
+                previous_attempts_context=previous_attempts_context,
             )
             cat_result.fix_attempts.append(fix)
 
-            if not fix.applied:
-                logger.warning(f"Fix not applied: {fix.rejected_reason or fix.explanation}")
+            if not apply_fix(fix, repo_path):
+                logger.warning(f"Fix validation/apply failed: {fix.rejected_reason or fix.explanation}")
                 rollback.rollback_last()
+                previous_attempts_context += (
+                    f"### Attempt {attempt_num} Failed to Apply\n"
+                    f"Reason: {fix.rejected_reason}\n\n"
+                )
                 continue
 
-            # Re-run the test
+            # Re-run the test to evaluate hypothesis
             retest_result = run_test_command(
                 repo_path=repo_path,
                 command=command,
@@ -299,20 +317,30 @@ def _execute_category(
                 max_output_lines=config.max_output_lines,
             )
             cat_result.test_results.append(retest_result)
+            
+            fix.passed = retest_result.is_success
 
-            if retest_result.is_success:
-                logger.info(f"Fix successful on attempt {attempt_num}!")
+            if fix.passed:
+                logger.info(f"Fix successful on attempt {attempt_num}! Fast-exiting the bounded search.")
+                fix.is_best_candidate = True
                 fixed = True
+                # Leave snapshot/applied fix intact
                 break
             else:
                 logger.warning(
-                    f"Fix attempt {attempt_num} did not resolve the failure"
+                    f"Fix hypothesis {attempt_num} did not resolve the failure "
+                    f"(Diff size: {fix.diff_size})"
                 )
-                # Rollback the failed fix
+                # Rollback precisely to baseline for a clean next attempt
                 rollback.rollback_last()
-
-                # Update test_result for the next iteration's context
-                test_result = retest_result
+                
+                # Feedback loop: Store the hypothesis and its specific error
+                previous_attempts_context += (
+                    f"### Attempt {attempt_num} Failed (Rolled Back)\n"
+                    f"You tried the following replacement:\n```\n{fix.replacement_content}\n```\n"
+                    f"It resulted in this error (val_bpb did not improve):\n```\n{retest_result.failure_summary}\n```\n"
+                    f"Do NOT re-suggest this approach.\n\n"
+                )
 
         if not fixed:
             cat_result.status = "uncertain"

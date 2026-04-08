@@ -11,7 +11,7 @@ It acts as a careful implementation partner: you code during the day, configure 
 - **LLM-Powered Categorization:** Reads your git diffs and infers logical test categories using Claude.
 - **Workflow-Driven Execution:** Enforces a manual planning and approval phase to ensure it only tests what you actually want tested.
 - **Safe Iteration:** Always works on a new, isolated branch named per run (e.g., `evalyn/2026-04-04`).
-- **Multi-Hypothesis Repair Loop:** Instead of single-shot guesses, Evalyn explores a bounded subset of repair hypotheses, scoring candidates on plan compliance and regression avoidance before retaining the safest fix.
+- **Multi-Hypothesis Repair Loop:** Instead of single-shot guesses, Evalyn explores a bounded subset of repair hypotheses using an autoresearch-inspired search loop. It tests candidates sequentially in isolation, injects historical context of failed fix attempts into ensuing prompts, records performance based on patch diff-size/simplicity, and fast-exits upon finding the first passing configuration.
 - **Atomic Rollback:** Failed experiments and losing repair candidates are cleanly reverted via internal `.patch` snapshots.
 - **Zero Auto-Commits:** Evalyn never commits code. All fixes are left unstaged for your manual review in the morning.
 - **Context-Aware:** Uses the target repository's own `CLAUDE.md` file as the single source of truth for the stack, rules, and commands.
