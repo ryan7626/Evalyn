@@ -39,7 +39,10 @@ Important Constraints:
 Browser / E2E Testing Instructions:
 - If the required testing implies UI, end-to-end, or browser interactions, you MUST generate a synchronous Python Playwright script.
 - The script must use standard synchronous playwright syntax: `from playwright.sync_api import sync_playwright`.
-- The script must be completely self-executing in a standard python environment, so include execution guards (e.g. `if __name__ == "__main__":`).
+- **IMPORTANT**: Set `headless=False` when launching Chromium so the user can visually see the automation running! (e.g. `p.chromium.launch(headless=False)`)
+- **IMPORTANT**: Add a `page.wait_for_timeout(10000)` (10 seconds) at the end of your test execution so the user has time to actually watch what the agent did before the browser closes!
+- The script must be completely self-executing in a standard python environment.
+- Use `python3` instead of `python` for your `run_command` bash hook to ensure compatibility on macOS.
 - If a target Local Dev Server URL is provided, ensure your Playwright script navigates to it!
 """
 

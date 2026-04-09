@@ -286,8 +286,18 @@ def _execute_category(
             cat_result.generated_tests.append(str(test_file_path))
             logger.info(f"Generated test file: {test_file_path}")
             
-            # Overwrite the empty commands list with the new run_command
-            commands = [ephemeral_test.get("run_command", f"echo 'No command provided for {test_file_path}'")]
+            raw_cmd = ephemeral_test.get("run_command", f"echo 'No command provided for {test_file_path}'")
+            raw_file = ephemeral_test.get("filename", "")
+            if raw_file and raw_file in raw_cmd:
+                raw_cmd = raw_cmd.replace(raw_file, str(test_file_path.absolute()))
+                
+            import sys
+            if raw_cmd.startswith("python3 "):
+                raw_cmd = raw_cmd.replace("python3 ", f"{sys.executable} ", 1)
+            elif raw_cmd.startswith("python "):
+                raw_cmd = raw_cmd.replace("python ", f"{sys.executable} ", 1)
+                
+            commands = [raw_cmd]
             
         except Exception as e:
             logger.error(f"Failed to generate ephemeral test: {e}")
