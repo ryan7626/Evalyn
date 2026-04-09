@@ -16,6 +16,7 @@ evalyn = "evalyn.cli:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "pytest-cov"]
+browser = ["playwright>=1.40.0"]
 
 [build-system]
 requires = ["setuptools>=68.0", "wheel"]

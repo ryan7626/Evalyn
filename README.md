@@ -12,6 +12,7 @@ It acts as a careful implementation partner: you code during the day, configure 
 - **Workflow-Driven Execution:** Enforces a manual planning and approval phase to ensure it only tests what you actually want tested.
 - **Safe Iteration:** Always works on a new, isolated branch named per run (e.g., `evalyn/2026-04-04`).
 - **Multi-Hypothesis Repair Loop:** Instead of single-shot guesses, Evalyn explores a bounded subset of repair hypotheses using an autoresearch-inspired search loop. It tests candidates sequentially in isolation, injects historical context of failed fix attempts into ensuing prompts, records performance based on patch diff-size/simplicity, and fast-exits upon finding the first passing configuration.
+- **Ephemeral Test Generation:** If your approved test plan dictates that testing is `REQUIRED` but no existing test files cover those files, Evalyn dynamically generates its own fully isolated tests, figures out how to run them, evaluates your code against them, and scrubs them away if everything works.
 - **Atomic Rollback:** Failed experiments and losing repair candidates are cleanly reverted via internal `.patch` snapshots.
 - **Zero Auto-Commits:** Evalyn never commits code. All fixes are left unstaged for your manual review in the morning.
 - **Context-Aware:** Uses the target repository's own `CLAUDE.md` file as the single source of truth for the stack, rules, and commands.
@@ -33,6 +34,10 @@ source .venv/bin/activate
 
 # Install Evalyn (this will install the CLI tool 'evalyn' into your PATH)
 pip install -e .
+
+# Optional: If you want Evalyn to perform functional Browser UI testing:
+pip install -e '.[browser]'
+playwright install chromium
 ```
 
 ## Configuration

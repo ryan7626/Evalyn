@@ -19,6 +19,7 @@ class CategoryResult:
     status: Literal["passed", "failed", "uncertain", "skipped"]
     test_results: list[TestResult] = field(default_factory=list)
     fix_attempts: list[FixAttempt] = field(default_factory=list)
+    generated_tests: list[str] = field(default_factory=list)
     error_message: str = ""
 
 

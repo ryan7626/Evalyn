@@ -14,6 +14,7 @@ from evalyn.llm.base import BaseLLM
 from evalyn.models import CategoryResult, RunResult
 from evalyn.planner.planner import check_plan_approved
 from evalyn.runner.fixer import generate_fix, apply_fix
+from evalyn.runner.test_generator import generate_ephemeral_test
 from evalyn.runner.rollback import RollbackManager
 from evalyn.runner.test_executor import run_test_command
 from evalyn.services.manager import ServiceManager
@@ -101,8 +102,8 @@ def run_execution_phase(
         return None
 
     logger.info(f"Categories to execute: {len(categories)}")
-    for name, _ in categories:
-        logger.info(f"  ▶ {name}")
+    for name, _, priority in categories:
+        logger.info(f"  ▶ [{priority.upper()}] {name}")
     if skipped:
         logger.info(f"Categories skipped: {len(skipped)}")
         for name, reason in skipped:
@@ -145,9 +146,11 @@ def run_execution_phase(
 
     # Start required services
     svc_manager = ServiceManager(config.repo_path, run_dir)
+    base_url = None
     if config.services:
         logger.info(f"Starting {len(config.services)} configured services")
         svc_manager.start_services(config.services)
+        base_url = svc_manager.get_base_url()
     
     # Execute each category
     run_result = RunResult(
@@ -165,9 +168,9 @@ def run_execution_phase(
         ))
 
     try:
-        for cat_name, cat_commands in categories:
+        for cat_name, cat_commands, priority in categories:
             logger.info(f"\n{'='*60}")
-            logger.info(f"Category: {cat_name}")
+            logger.info(f"Category: [{priority.upper()}] {cat_name}")
             logger.info(f"{'='*60}")
 
             cat_result = _execute_category(
@@ -178,6 +181,9 @@ def run_execution_phase(
                 category_name=cat_name,
                 commands=cat_commands,
                 relevant_files=_extract_files_for_category(plan_path, cat_name),
+                run_dir=run_dir,
+                priority=priority,
+                base_url=base_url,
             )
             run_result.category_results.append(cat_result)
 
@@ -248,10 +254,46 @@ def _execute_category(
     category_name: str,
     commands: list[str],
     relevant_files: list[str],
+    run_dir: Path,
+    priority: str,
+    base_url: str | None = None,
 ) -> CategoryResult:
     """Execute all test commands for a single category with fix loop."""
 
     cat_result = CategoryResult(name=category_name, status="passed")
+
+    if priority == "required" and not commands:
+        logger.info(f"Required category '{category_name}' lacks test coverage. Generating ephemeral test suite...")
+        try:
+            ephemeral_test = generate_ephemeral_test(
+                llm=llm,
+                category_name=category_name,
+                relevant_files=relevant_files,
+                claude_md_content=config.claude_md_content,
+                run_dir=run_dir,
+                base_url=base_url,
+            )
+            # Create the file
+            generated_tests_dir = run_dir / "generated-tests"
+            generated_tests_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Flatten name to be safe
+            safe_filename = ephemeral_test.get("filename", f"{category_name.replace(' ', '_')}.test").replace("/", "_")
+            test_file_path = generated_tests_dir / safe_filename
+            test_file_path.write_text(ephemeral_test.get("content", ""), encoding="utf-8")
+            
+            # Log it
+            cat_result.generated_tests.append(str(test_file_path))
+            logger.info(f"Generated test file: {test_file_path}")
+            
+            # Overwrite the empty commands list with the new run_command
+            commands = [ephemeral_test.get("run_command", f"echo 'No command provided for {test_file_path}'")]
+            
+        except Exception as e:
+            logger.error(f"Failed to generate ephemeral test: {e}")
+            cat_result.status = "uncertain"
+            cat_result.error_message = f"Missing required test coverage and generation failed: {e}"
+            return cat_result
 
     for command in commands:
         # Run the test
@@ -352,6 +394,15 @@ def _execute_category(
                 f"Category '{category_name}' marked UNCERTAIN after "
                 f"{config.max_fix_retries} fix attempts"
             )
+
+    if cat_result.status == "passed" and cat_result.generated_tests:
+        logger.info(f"Category '{category_name}' passed. Cleaning up ephemeral tests...")
+        for gen_test in cat_result.generated_tests:
+            try:
+                Path(gen_test).unlink(missing_ok=True)
+                logger.info(f"Removed ephemeral test: {gen_test}")
+            except Exception as e:
+                logger.warning(f"Failed to remove ephemeral test {gen_test}: {e}")
 
     return cat_result
 
@@ -467,7 +518,7 @@ def _apply_category_filters(
     *,
     cli_filter: Optional[list[str]] = None,
     directives: Optional[dict] = None,
-) -> tuple[list[tuple[str, list[str]]], list[tuple[str, str]]]:
+) -> tuple[list[tuple[str, list[str], str]], list[tuple[str, str]]]:
     """Filter categories based on CLI flags, user notes, and plan markers.
 
     Priority order:
@@ -482,13 +533,13 @@ def _apply_category_filters(
 
     Returns:
         Tuple of:
-          - categories to execute: list of (name, commands)
+          - categories to execute: list of (name, commands, priority)
           - skipped categories: list of (name, reason)
     """
     if directives is None:
         directives = {"only_run": [], "skip": [], "max_categories": None}
 
-    to_execute: list[tuple[str, list[str]]] = []
+    to_execute: list[tuple[str, list[str], str]] = []
     skipped: list[tuple[str, str]] = []
 
     # Normalize names for case-insensitive matching
@@ -507,7 +558,7 @@ def _apply_category_filters(
         # 2. CLI --category filter takes highest priority
         if cli_names:
             if name_lower in cli_names:
-                to_execute.append((name, commands))
+                to_execute.append((name, commands, priority))
             else:
                 skipped.append((name, "not in --category filter"))
             continue
@@ -515,7 +566,7 @@ def _apply_category_filters(
         # 3. ONLY RUN directive — if present, only named categories run
         if only_run_names:
             if name_lower in only_run_names:
-                to_execute.append((name, commands))
+                to_execute.append((name, commands, priority))
             else:
                 skipped.append((name, "not in ONLY RUN directive"))
             continue
@@ -527,7 +578,7 @@ def _apply_category_filters(
 
         # 5. Default: only execute REQUIRED categories
         if priority == "required":
-            to_execute.append((name, commands))
+            to_execute.append((name, commands, priority))
         else:
             skipped.append((name, f"[{priority.upper()}] — not required"))
 
@@ -536,7 +587,7 @@ def _apply_category_filters(
     if max_cats is not None and len(to_execute) > max_cats:
         overflow = to_execute[max_cats:]
         to_execute = to_execute[:max_cats]
-        for name, _ in overflow:
+        for name, _, _ in overflow:
             skipped.append((name, f"exceeded MAX CATEGORIES {max_cats}"))
 
     return to_execute, skipped

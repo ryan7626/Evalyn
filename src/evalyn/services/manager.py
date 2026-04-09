@@ -159,6 +159,13 @@ class ServiceManager:
         """Number of services started by the agent."""
         return len(self._started)
 
+    def get_base_url(self) -> Optional[str]:
+        """Get the base URL of the first service with a port."""
+        for managed in self._started:
+            if managed.definition.port:
+                return f"http://localhost:{managed.definition.port}"
+        return None
+
 
 def _is_port_in_use(port: int) -> bool:
     """Check if a TCP port is in use."""

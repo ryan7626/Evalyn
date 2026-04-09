@@ -187,7 +187,7 @@ class TestApplyCategoryFilters:
             ("C", ["cmd3"], "required"),
         )
         to_run, skipped = _apply_category_filters(cats)
-        assert [n for n, _ in to_run] == ["A", "C"]
+        assert [n for n, _, _ in to_run] == ["A", "C"]
         assert [n for n, _ in skipped] == ["B"]
 
     def test_skip_marker_always_skips(self):
@@ -196,7 +196,7 @@ class TestApplyCategoryFilters:
             ("B", ["cmd2"], "skip"),
         )
         to_run, skipped = _apply_category_filters(cats)
-        assert [n for n, _ in to_run] == ["A"]
+        assert [n for n, _, _ in to_run] == ["A"]
         assert skipped[0] == ("B", "[SKIP] marker in plan")
 
     def test_cli_filter_overrides_everything(self):
@@ -208,7 +208,7 @@ class TestApplyCategoryFilters:
         to_run, skipped = _apply_category_filters(
             cats, cli_filter=["C"]
         )
-        assert [n for n, _ in to_run] == ["C"]
+        assert [n for n, _, _ in to_run] == ["C"]
         assert len(skipped) == 2
 
     def test_cli_filter_still_respects_skip_marker(self):
@@ -220,7 +220,7 @@ class TestApplyCategoryFilters:
             cats, cli_filter=["A", "B"]
         )
         # A is [SKIP] in the plan header, should still be skipped
-        assert [n for n, _ in to_run] == ["B"]
+        assert [n for n, _, _ in to_run] == ["B"]
         assert ("A", "[SKIP] marker in plan") in skipped
 
     def test_only_run_directive(self):
@@ -231,7 +231,7 @@ class TestApplyCategoryFilters:
         )
         directives = {"only_run": ["B"], "skip": [], "max_categories": None}
         to_run, skipped = _apply_category_filters(cats, directives=directives)
-        assert [n for n, _ in to_run] == ["B"]
+        assert [n for n, _, _ in to_run] == ["B"]
         assert len(skipped) == 2
 
     def test_skip_directive(self):
@@ -241,7 +241,7 @@ class TestApplyCategoryFilters:
         )
         directives = {"only_run": [], "skip": ["A"], "max_categories": None}
         to_run, skipped = _apply_category_filters(cats, directives=directives)
-        assert [n for n, _ in to_run] == ["B"]
+        assert [n for n, _, _ in to_run] == ["B"]
         assert ("A", "SKIP directive in user notes") in skipped
 
     def test_max_categories_limit(self):
@@ -252,7 +252,7 @@ class TestApplyCategoryFilters:
         )
         directives = {"only_run": [], "skip": [], "max_categories": 1}
         to_run, skipped = _apply_category_filters(cats, directives=directives)
-        assert [n for n, _ in to_run] == ["A"]
+        assert [n for n, _, _ in to_run] == ["A"]
         skip_names = [n for n, _ in skipped]
         assert "B" in skip_names
         assert "C" in skip_names
@@ -264,7 +264,7 @@ class TestApplyCategoryFilters:
         to_run, skipped = _apply_category_filters(
             cats, cli_filter=["ui enhancements"]
         )
-        assert [n for n, _ in to_run] == ["UI Enhancements"]
+        assert [n for n, _, _ in to_run] == ["UI Enhancements"]
 
     def test_only_run_forces_optional(self):
         cats = self._cats(
@@ -273,7 +273,7 @@ class TestApplyCategoryFilters:
         )
         directives = {"only_run": ["A"], "skip": [], "max_categories": None}
         to_run, skipped = _apply_category_filters(cats, directives=directives)
-        assert [n for n, _ in to_run] == ["A"]
+        assert [n for n, _, _ in to_run] == ["A"]
 
     def test_empty_categories_returns_empty(self):
         to_run, skipped = _apply_category_filters([])
