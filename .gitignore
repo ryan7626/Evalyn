@@ -45,6 +45,10 @@ coverage.xml
 # Agent runtime directory (target repos)
 .agent/
 
+# Temporary repos and scratch dirs created during dev/test runs
+.tmp_eval_repo/
+.tmp_autoresearch/
+
 # macOS
 .DS_Store
 
