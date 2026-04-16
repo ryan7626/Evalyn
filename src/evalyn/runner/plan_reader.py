@@ -21,6 +21,21 @@ from evalyn.utils.log import get_logger
 logger = get_logger("runner.plan_reader")
 
 
+# Prefixes that unambiguously identify a string as a shell command.
+# Any backtick content not starting with one of these is treated as a file
+# path or description and is ignored during command extraction.
+_COMMAND_PREFIXES = (
+    "pytest", "python", "python3",
+    "npm ", "npx ", "yarn ",
+    "cargo ", "go test", "go run",
+    "make ", "bash ", "sh ",
+    "node ", "tsx ", "ts-node ",
+    "ruff ", "mypy ", "black ",
+    "jest ", "vitest ",
+    "pnpm ",
+)
+
+
 def parse_plan_categories(plan_path: Path) -> list[tuple[str, list[str], str]]:
     """Parse test categories and their commands from a plan.md file.
 
@@ -47,17 +62,19 @@ def parse_plan_categories(plan_path: Path) -> list[tuple[str, list[str], str]]:
         end = matches[i + 1].start() if i + 1 < len(matches) else len(content)
         section = content[start:end]
 
-        # Find commands (lines starting with `- ` that contain backtick-wrapped commands)
+        # Find commands (list items that contain a backtick-wrapped command)
         commands = []
         for line in section.split("\n"):
             if "relevant files" in line.lower() or "description" in line.lower():
                 continue
-            # Match lines like: - `npm test -- --grep auth`
+            # Match lines like:  - `pytest tests/auth/`
             cmd_match = re.search(r"`([^`]+)`", line)
             if cmd_match and line.strip().startswith("-"):
-                cmd = cmd_match.group(1)
-                # Skip if it looks like a file path rather than a command
-                if not cmd.startswith("/") and not cmd.startswith("src/"):
+                cmd = cmd_match.group(1).strip()
+                # Only accept strings that start with a known command prefix.
+                # This prevents file paths like `lib/util.ts` from being
+                # mistaken for runnable commands.
+                if any(cmd.startswith(p) for p in _COMMAND_PREFIXES):
                     commands.append(cmd)
 
         categories.append((name, commands, priority))

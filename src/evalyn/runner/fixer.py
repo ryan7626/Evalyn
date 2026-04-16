@@ -269,8 +269,8 @@ def _read_source_files(
     repo_path: Path,
     file_paths: list[str],
     *,
-    max_files: int = 5,
-    max_lines_per_file: int = 200,
+    max_files: int = 8,
+    max_lines_per_file: int = 300,
 ) -> str:
     """Read and format source files for the LLM prompt."""
     sections = []

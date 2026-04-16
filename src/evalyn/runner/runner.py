@@ -4,6 +4,7 @@ The core execution loop: validate plan, create branch, run tests per category,
 attempt fixes on failure, manage rollback, and trigger reporting.
 """
 
+import signal
 import sys
 import re
 import time
@@ -40,6 +41,12 @@ from evalyn.utils.log import get_logger, setup_logging
 logger = get_logger("runner")
 
 
+def _sigterm_handler(signum, frame):
+    """Convert SIGTERM to KeyboardInterrupt so the rollback logic in
+    run_execution_phase fires instead of the process being killed silently."""
+    raise KeyboardInterrupt(f"Signal {signum} (SIGTERM) received")
+
+
 def run_execution_phase(
     config: Config,
     state: AgentState,
@@ -70,7 +77,10 @@ def run_execution_phase(
     # Find the latest run directory (where the plan should be)
     run_dir = get_latest_run_dir(config.repo_path)
     if run_dir is None:
-        logger.error("No run directory found. Run 'evalyn plan' first.")
+        logger.error(
+            "No run directory found. "
+            "Run `evalyn plan --repo <path>` first to generate a test plan."
+        )
         return None
 
     plan_path = run_dir / "plan.md"
@@ -118,10 +128,26 @@ def run_execution_phase(
         for name, reason in skipped:
             logger.info(f"  ⏭ {name} — {reason}")
 
-    # Dry run: print what would happen and exit
+    # Dry run: show what would execute and return a summary result
     if dry_run:
         logger.info("Dry run — no branch created, no tests executed.")
-        return None
+        dry_result = RunResult(timestamp=timestamp, branch="(dry-run)", run_dir=run_dir)
+        for cat_name, _, priority in categories:
+            dry_result.category_results.append(CategoryResult(
+                name=cat_name,
+                status="skipped",
+                error_message=f"Dry run — would execute [{priority.upper()}]",
+            ))
+        for skip_name, reason in skipped:
+            dry_result.category_results.append(CategoryResult(
+                name=skip_name,
+                status="skipped",
+                error_message=reason,
+            ))
+        return dry_result
+
+    # Register SIGTERM handler so an OS kill triggers the rollback path
+    _prev_sigterm = signal.signal(signal.SIGTERM, _sigterm_handler)
 
     # Create a new branch for this run
     timestamp = run_dir.name
@@ -237,8 +263,13 @@ def run_execution_phase(
     except Exception as e:
         logger.error(f"Report generation failed: {e}")
 
-    # Update state
-    state.last_run_status = "completed"
+    # Update state — derive status from actual outcomes
+    if run_result.failed_count > 0 or run_result.uncertain_count > 0:
+        final_status = "completed_with_issues"
+    else:
+        final_status = "completed"
+
+    state.last_run_status = final_status
     state.last_run_timestamp = timestamp
     state.run_history.append({
         "timestamp": timestamp,
@@ -249,6 +280,8 @@ def run_execution_phase(
         "skipped": run_result.skipped_count,
         "duration_seconds": round(run_result.total_duration_seconds, 1),
     })
+    # Cap history to last 50 runs to prevent unbounded growth
+    state.run_history = state.run_history[-50:]
     save_state(config.repo_path, state)
 
     logger.info(f"\nExecution complete in {run_result.total_duration_seconds:.1f}s")
@@ -257,6 +290,9 @@ def run_execution_phase(
         f"{run_result.failed_count} failed, "
         f"{run_result.uncertain_count} uncertain"
     )
+
+    # Restore original SIGTERM handler now that rollback window has passed
+    signal.signal(signal.SIGTERM, _prev_sigterm)
 
     return run_result
 
@@ -431,6 +467,10 @@ def _execute_category(
                 f"Category '{category_name}' marked UNCERTAIN after "
                 f"{config.max_fix_retries} fix attempts"
             )
+            # Stop processing further commands in this category — the
+            # category is already compromised; running more commands would
+            # produce misleading partial results.
+            break
 
     if cat_result.status == "passed" and cat_result.generated_tests:
         logger.info(f"Category '{category_name}' passed. Cleaning up ephemeral tests...")

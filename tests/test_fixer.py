@@ -168,7 +168,8 @@ class TestReadSourceFiles:
 
     def test_truncates_long_file(self):
         _, repo = _repo_with_file()
-        (repo / "big.py").write_text("\n".join(f"line {i}" for i in range(300)), encoding="utf-8")
+        # File must exceed the max_lines_per_file=300 threshold to trigger truncation
+        (repo / "big.py").write_text("\n".join(f"line {i}" for i in range(400)), encoding="utf-8")
         result = _read_source_files(repo, ["big.py"])
         assert "truncated" in result
 

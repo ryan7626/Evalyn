@@ -61,18 +61,27 @@ def load_config(repo_path: Path) -> Config:
     """
     repo_path = repo_path.resolve()
 
-    # Read CLAUDE.md (required)
-    claude_md_path = repo_path / "CLAUDE.md"
-    if not claude_md_path.is_file():
-        raise ConfigError(f"CLAUDE.md not found at {claude_md_path}")
+    # Read CLAUDE.md (required) — try common casings for Linux compatibility
+    claude_md_path = None
+    for name in ("CLAUDE.md", "claude.md", "Claude.md"):
+        candidate = repo_path / name
+        if candidate.is_file():
+            claude_md_path = candidate
+            break
+
+    if claude_md_path is None:
+        raise ConfigError(
+            f"CLAUDE.md not found at {repo_path}. "
+            "Evalyn requires a CLAUDE.md context file in the target repository."
+        )
 
     try:
         claude_md_content = claude_md_path.read_text(encoding="utf-8")
     except OSError as e:
-        raise ConfigError(f"Failed to read CLAUDE.md: {e}")
+        raise ConfigError(f"Failed to read {claude_md_path.name}: {e}")
 
     if not claude_md_content.strip():
-        raise ConfigError(f"CLAUDE.md is empty: {claude_md_path}")
+        raise ConfigError(f"{claude_md_path.name} is empty: {claude_md_path}")
 
     # Start with defaults
     config = Config(
@@ -105,12 +114,19 @@ def _apply_overrides(config: Config, overrides: dict) -> None:
 
     execution = overrides.get("execution", {})
     if isinstance(execution, dict):
-        if "max_fix_retries" in execution:
-            config.max_fix_retries = int(execution["max_fix_retries"])
-        if "test_timeout_seconds" in execution:
-            config.test_timeout_seconds = int(execution["test_timeout_seconds"])
-        if "max_output_lines" in execution:
-            config.max_output_lines = int(execution["max_output_lines"])
+        for key, attr in (
+            ("max_fix_retries", "max_fix_retries"),
+            ("test_timeout_seconds", "test_timeout_seconds"),
+            ("max_output_lines", "max_output_lines"),
+        ):
+            if key in execution:
+                try:
+                    setattr(config, attr, int(execution[key]))
+                except (TypeError, ValueError):
+                    raise ConfigError(
+                        f"Invalid value for {key} in .agent/config.yaml: "
+                        f"{execution[key]!r} (expected an integer)"
+                    )
 
     services = overrides.get("services", [])
     if isinstance(services, list):
