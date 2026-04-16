@@ -73,7 +73,7 @@ def _render_markdown_report(result: RunResult) -> str:
 
 def _render_category_result(cat: CategoryResult) -> list[str]:
     """Render a single category's result as markdown."""
-    icon = {"passed": "✅", "failed": "❌", "uncertain": "❓"}.get(cat.status, "❓")
+    icon = {"passed": "✅", "failed": "❌", "uncertain": "❓", "skipped": "⏭"}.get(cat.status, "❓")
     status_label = cat.status.upper()
 
     lines = [

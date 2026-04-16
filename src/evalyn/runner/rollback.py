@@ -76,9 +76,13 @@ class RollbackManager:
 
         # Re-apply all remaining patches in order
         for patch in self._patches:
-            if patch.is_file():
+            if not patch.is_file():
+                continue
+            try:
                 logger.debug(f"Re-applying: {patch.name}")
                 apply_patch(self.repo_path, patch)
+            except Exception as e:
+                logger.warning(f"Failed to re-apply patch {patch.name}: {e}")
 
         logger.info(
             f"Rollback complete. {len(self._patches)} patches remaining."

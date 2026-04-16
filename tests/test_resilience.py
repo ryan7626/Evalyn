@@ -84,7 +84,7 @@ class TestRecoverStaleState:
     """Tests for _recover_stale_state in runner.py."""
 
     def test_recovers_in_progress_state(self, tmp_path):
-        from evalyn.runner.runner import _recover_stale_state
+        from evalyn.runner.plan_reader import recover_stale_state as _recover_stale_state
 
         repo = _init_repo(tmp_path)
         stale_branch = "evalyn/stale"
@@ -103,7 +103,7 @@ class TestRecoverStaleState:
         assert branch_exists(repo, stale_branch) is False
 
     def test_removes_stale_target_branch(self, tmp_path):
-        from evalyn.runner.runner import _recover_stale_state
+        from evalyn.runner.plan_reader import recover_stale_state as _recover_stale_state
 
         repo = _init_repo(tmp_path)
         target = "evalyn/2026-01-01"
@@ -117,7 +117,7 @@ class TestRecoverStaleState:
         assert branch_exists(repo, target) is False
 
     def test_no_op_when_clean(self, tmp_path):
-        from evalyn.runner.runner import _recover_stale_state
+        from evalyn.runner.plan_reader import recover_stale_state as _recover_stale_state
 
         repo = _init_repo(tmp_path)
         state = AgentState(last_run_status="completed")
@@ -128,7 +128,7 @@ class TestRecoverStaleState:
         assert state.last_run_status == "completed"
 
     def test_recovers_when_on_stale_branch(self, tmp_path):
-        from evalyn.runner.runner import _recover_stale_state
+        from evalyn.runner.plan_reader import recover_stale_state as _recover_stale_state
         from evalyn.utils.git import get_current_branch
 
         repo = _init_repo(tmp_path)

@@ -4,6 +4,7 @@ The core execution loop: validate plan, create branch, run tests per category,
 attempt fixes on failure, manage rollback, and trigger reporting.
 """
 
+import sys
 import re
 import time
 from pathlib import Path
@@ -14,9 +15,16 @@ from evalyn.llm.base import BaseLLM
 from evalyn.models import CategoryResult, RunResult
 from evalyn.planner.planner import check_plan_approved
 from evalyn.runner.fixer import generate_fix, apply_fix
-from evalyn.runner.test_generator import generate_ephemeral_test
+from evalyn.runner.plan_reader import (
+    parse_plan_categories,
+    parse_user_notes,
+    apply_category_filters,
+    extract_files_for_category,
+    recover_stale_state,
+)
 from evalyn.runner.rollback import RollbackManager
 from evalyn.runner.test_executor import run_test_command
+from evalyn.runner.test_generator import generate_ephemeral_test
 from evalyn.services.manager import ServiceManager
 from evalyn.state import AgentState, save_state, get_latest_run_dir
 from evalyn.utils.git import (
@@ -25,7 +33,6 @@ from evalyn.utils.git import (
     get_current_branch,
     checkout_branch,
     delete_branch,
-    branch_exists,
     reset_hard,
 )
 from evalyn.utils.log import get_logger, setup_logging
@@ -52,6 +59,8 @@ def run_execution_phase(
         config: Resolved configuration.
         state: Current agent state.
         llm: LLM provider instance.
+        category_filter: Optional list of category names to run (from --category CLI flag).
+        dry_run: If True, parse plan and show what would run without executing.
 
     Returns:
         RunResult with all execution details, or None if plan is not approved.
@@ -82,16 +91,16 @@ def run_execution_phase(
     logger.info("Plan approved — starting execution phase")
 
     # Parse categories from the approved plan
-    all_categories = _parse_plan_categories(plan_path)
+    all_categories = parse_plan_categories(plan_path)
     if not all_categories:
         logger.error("No test categories found in the approved plan.")
         return None
 
     # Parse user notes for directives
-    user_directives = _parse_user_notes(plan_path)
+    user_directives = parse_user_notes(plan_path)
 
     # Apply filtering: CLI --category > user notes > default (all REQUIRED)
-    categories, skipped = _apply_category_filters(
+    categories, skipped = apply_category_filters(
         all_categories,
         cli_filter=category_filter,
         directives=user_directives,
@@ -130,7 +139,7 @@ def run_execution_phase(
             original_branch = "master"
 
     # Pre-flight: detect and recover from stale state
-    _recover_stale_state(config.repo_path, state, branch_name, original_branch)
+    recover_stale_state(config.repo_path, state, branch_name, original_branch)
 
     create_branch(config.repo_path, branch_name)
     logger.info(f"Created branch: {branch_name}")
@@ -151,7 +160,7 @@ def run_execution_phase(
         logger.info(f"Starting {len(config.services)} configured services")
         svc_manager.start_services(config.services)
         base_url = svc_manager.get_base_url()
-    
+
     # Execute each category
     run_result = RunResult(
         timestamp=timestamp,
@@ -180,7 +189,7 @@ def run_execution_phase(
                 repo_path=config.repo_path,
                 category_name=cat_name,
                 commands=cat_commands,
-                relevant_files=_extract_files_for_category(plan_path, cat_name),
+                relevant_files=extract_files_for_category(plan_path, cat_name),
                 run_dir=run_dir,
                 priority=priority,
                 base_url=base_url,
@@ -192,15 +201,21 @@ def run_execution_phase(
     except BaseException as e:
         # An unexpected exception or KeyboardInterrupt occurred.
         # Ensure we discard the messy branch to return to target's clean original state.
-        logger.warning(f"Run aborted due to '{type(e).__name__}'. Rolling back strictly to '{original_branch}'...")
+        logger.warning(
+            f"Run aborted due to '{type(e).__name__}'. "
+            f"Rolling back strictly to '{original_branch}'..."
+        )
         try:
             reset_hard(config.repo_path)
             checkout_branch(config.repo_path, original_branch)
             delete_branch(config.repo_path, branch_name, force=True)
-            logger.info(f"Safely removed aborted branch '{branch_name}' and restored '{original_branch}'.")
+            logger.info(
+                f"Safely removed aborted branch '{branch_name}' "
+                f"and restored '{original_branch}'."
+            )
         except Exception as rollback_err:
             logger.error(f"Failed to cleanly rollback branch during abort: {rollback_err}")
-            
+
         state.last_run_status = "aborted"
         save_state(config.repo_path, state)
         raise e
@@ -263,7 +278,10 @@ def _execute_category(
     cat_result = CategoryResult(name=category_name, status="passed")
 
     if priority == "required" and not commands:
-        logger.info(f"Required category '{category_name}' lacks test coverage. Generating ephemeral test suite...")
+        logger.info(
+            f"Required category '{category_name}' lacks test coverage. "
+            "Generating ephemeral test suite..."
+        )
         try:
             ephemeral_test = generate_ephemeral_test(
                 llm=llm,
@@ -276,33 +294,42 @@ def _execute_category(
             # Create the file
             generated_tests_dir = run_dir / "generated-tests"
             generated_tests_dir.mkdir(parents=True, exist_ok=True)
-            
+
             # Flatten name to be safe
-            safe_filename = ephemeral_test.get("filename", f"{category_name.replace(' ', '_')}.test").replace("/", "_")
+            safe_filename = (
+                ephemeral_test
+                .get("filename", f"{category_name.replace(' ', '_')}.test")
+                .replace("/", "_")
+            )
             test_file_path = generated_tests_dir / safe_filename
             test_file_path.write_text(ephemeral_test.get("content", ""), encoding="utf-8")
-            
+
             # Log it
             cat_result.generated_tests.append(str(test_file_path))
             logger.info(f"Generated test file: {test_file_path}")
-            
-            raw_cmd = ephemeral_test.get("run_command", f"echo 'No command provided for {test_file_path}'")
+
+            raw_cmd = ephemeral_test.get(
+                "run_command",
+                f"echo 'No command provided for {test_file_path}'"
+            )
             raw_file = ephemeral_test.get("filename", "")
             if raw_file and raw_file in raw_cmd:
                 raw_cmd = raw_cmd.replace(raw_file, str(test_file_path.absolute()))
-                
-            import sys
+
+            # Use the active interpreter so venv packages are available
             if raw_cmd.startswith("python3 "):
                 raw_cmd = raw_cmd.replace("python3 ", f"{sys.executable} ", 1)
             elif raw_cmd.startswith("python "):
                 raw_cmd = raw_cmd.replace("python ", f"{sys.executable} ", 1)
-                
+
             commands = [raw_cmd]
-            
+
         except Exception as e:
             logger.error(f"Failed to generate ephemeral test: {e}")
             cat_result.status = "uncertain"
-            cat_result.error_message = f"Missing required test coverage and generation failed: {e}"
+            cat_result.error_message = (
+                f"Missing required test coverage and generation failed: {e}"
+            )
             return cat_result
 
     for command in commands:
@@ -325,7 +352,7 @@ def _execute_category(
         fixed = False
         previous_attempts_context = ""
         base_test_result = test_result  # Keep original baseline test output
-        
+
         # Bounded Autoresearch Loop
         for attempt_num in range(1, config.max_fix_retries + 1):
             logger.info(
@@ -369,7 +396,7 @@ def _execute_category(
                 max_output_lines=config.max_output_lines,
             )
             cat_result.test_results.append(retest_result)
-            
+
             fix.passed = retest_result.is_success
 
             if fix.passed:
@@ -385,12 +412,12 @@ def _execute_category(
                 )
                 # Rollback precisely to baseline for a clean next attempt
                 rollback.rollback_last()
-                
+
                 # Feedback loop: Store the hypothesis and its specific error
                 previous_attempts_context += (
                     f"### Attempt {attempt_num} Failed (Rolled Back)\n"
                     f"You tried the following replacement:\n```\n{fix.replacement_content}\n```\n"
-                    f"It resulted in this error (val_bpb did not improve):\n```\n{retest_result.failure_summary}\n```\n"
+                    f"It resulted in this error:\n```\n{retest_result.failure_summary}\n```\n"
                     f"Do NOT re-suggest this approach.\n\n"
                 )
 
@@ -415,269 +442,3 @@ def _execute_category(
                 logger.warning(f"Failed to remove ephemeral test {gen_test}: {e}")
 
     return cat_result
-
-
-def _parse_plan_categories(plan_path: Path) -> list[tuple[str, list[str], str]]:
-    """Parse test categories and their commands from a plan.md file.
-
-    Returns list of (category_name, [commands], priority).
-    Priority is one of: 'required', 'optional', 'skip'.
-    """
-    content = plan_path.read_text(encoding="utf-8")
-    categories = []
-
-    # Match category headers: ### [REQUIRED|OPTIONAL|SKIP] Category Name
-    category_pattern = re.compile(
-        r"^###\s+\[(REQUIRED|OPTIONAL|SKIP)\]\s+(.+)$",
-        re.MULTILINE | re.IGNORECASE,
-    )
-
-    matches = list(category_pattern.finditer(content))
-
-    for i, match in enumerate(matches):
-        priority = match.group(1).lower()
-        name = match.group(2).strip()
-
-        # Extract section content between this match and the next
-        start = match.end()
-        end = matches[i + 1].start() if i + 1 < len(matches) else len(content)
-        section = content[start:end]
-
-        # Find commands (lines starting with ` - ` that contain backtick-wrapped commands)
-        commands = []
-        for line in section.split("\n"):
-            # Match lines like: - `npm test -- --grep auth`
-            cmd_match = re.search(r"`([^`]+)`", line)
-            if cmd_match and line.strip().startswith("-"):
-                cmd = cmd_match.group(1)
-                # Skip if it looks like a file path rather than a command
-                if not cmd.startswith("/") and not cmd.startswith("src/"):
-                    commands.append(cmd)
-
-        categories.append((name, commands, priority))
-
-    return categories
-
-
-def _parse_user_notes(plan_path: Path) -> dict:
-    """Parse the User Notes section for actionable directives.
-
-    Supported directives:
-      ONLY RUN <category>[, <category2>, ...]
-      SKIP <category>
-      MAX CATEGORIES <N>
-
-    Returns a dict with keys: 'only_run', 'skip', 'max_categories'.
-    """
-    content = plan_path.read_text(encoding="utf-8")
-    directives: dict = {
-        "only_run": [],
-        "skip": [],
-        "max_categories": None,
-    }
-
-    # Find content after "Status: APPROVED" or "## User Notes"
-    notes_start = None
-    for marker in ["## User Notes", "Status: APPROVED"]:
-        idx = content.lower().find(marker.lower())
-        if idx != -1:
-            notes_start = idx + len(marker)
-            break
-
-    if notes_start is None:
-        return directives
-
-    notes_section = content[notes_start:]
-
-    for line in notes_section.split("\n"):
-        stripped = line.strip()
-        # Skip HTML comments and empty lines
-        if not stripped or stripped.startswith("<!--"):
-            continue
-
-        upper = stripped.upper()
-
-        # ONLY RUN <name>, <name2>
-        if upper.startswith("ONLY RUN "):
-            names_str = stripped[len("ONLY RUN "):]
-            names = [n.strip() for n in names_str.split(",") if n.strip()]
-            directives["only_run"].extend(names)
-            logger.info(f"User directive: ONLY RUN {names}")
-
-        # SKIP <name>
-        elif upper.startswith("SKIP "):
-            name = stripped[len("SKIP "):].strip()
-            if name:
-                directives["skip"].append(name)
-                logger.info(f"User directive: SKIP {name}")
-
-        # MAX CATEGORIES <N>
-        elif upper.startswith("MAX CATEGORIES "):
-            try:
-                n = int(stripped[len("MAX CATEGORIES "):])
-                directives["max_categories"] = n
-                logger.info(f"User directive: MAX CATEGORIES {n}")
-            except ValueError:
-                logger.warning(f"Invalid MAX CATEGORIES value: {stripped}")
-
-    return directives
-
-
-def _apply_category_filters(
-    all_categories: list[tuple[str, list[str], str]],
-    *,
-    cli_filter: Optional[list[str]] = None,
-    directives: Optional[dict] = None,
-) -> tuple[list[tuple[str, list[str], str]], list[tuple[str, str]]]:
-    """Filter categories based on CLI flags, user notes, and plan markers.
-
-    Priority order:
-      1. CLI --category filter (highest priority)
-      2. User notes directives (ONLY RUN, SKIP, MAX CATEGORIES)
-      3. Plan markers ([SKIP] header, [OPTIONAL] excluded by default)
-
-    Args:
-        all_categories: Parsed categories as (name, commands, priority).
-        cli_filter: Category names from --category CLI flag.
-        directives: Parsed user notes directives dict.
-
-    Returns:
-        Tuple of:
-          - categories to execute: list of (name, commands, priority)
-          - skipped categories: list of (name, reason)
-    """
-    if directives is None:
-        directives = {"only_run": [], "skip": [], "max_categories": None}
-
-    to_execute: list[tuple[str, list[str], str]] = []
-    skipped: list[tuple[str, str]] = []
-
-    # Normalize names for case-insensitive matching
-    cli_names = [n.lower() for n in (cli_filter or [])]
-    only_run_names = [n.lower() for n in directives.get("only_run", [])]
-    skip_names = [n.lower() for n in directives.get("skip", [])]
-
-    for name, commands, priority in all_categories:
-        name_lower = name.lower()
-
-        # 1. [SKIP] in header — always skip
-        if priority == "skip":
-            skipped.append((name, "[SKIP] marker in plan"))
-            continue
-
-        # 2. CLI --category filter takes highest priority
-        if cli_names:
-            if name_lower in cli_names:
-                to_execute.append((name, commands, priority))
-            else:
-                skipped.append((name, "not in --category filter"))
-            continue
-
-        # 3. ONLY RUN directive — if present, only named categories run
-        if only_run_names:
-            if name_lower in only_run_names:
-                to_execute.append((name, commands, priority))
-            else:
-                skipped.append((name, "not in ONLY RUN directive"))
-            continue
-
-        # 4. SKIP directive — skip named categories
-        if name_lower in skip_names:
-            skipped.append((name, "SKIP directive in user notes"))
-            continue
-
-        # 5. Default: only execute REQUIRED categories
-        if priority == "required":
-            to_execute.append((name, commands, priority))
-        else:
-            skipped.append((name, f"[{priority.upper()}] — not required"))
-
-    # 6. Apply MAX CATEGORIES limit
-    max_cats = directives.get("max_categories")
-    if max_cats is not None and len(to_execute) > max_cats:
-        overflow = to_execute[max_cats:]
-        to_execute = to_execute[:max_cats]
-        for name, _, _ in overflow:
-            skipped.append((name, f"exceeded MAX CATEGORIES {max_cats}"))
-
-    return to_execute, skipped
-
-
-def _extract_files_for_category(plan_path: Path, category_name: str) -> list[str]:
-    """Extract relevant file paths for a category from the plan.
-
-    Looks for the 'Relevant files' line in the category section.
-    """
-    content = plan_path.read_text(encoding="utf-8")
-    files = []
-
-    # Find the category section
-    pattern = re.compile(
-        rf"###\s+\[(?:REQUIRED|OPTIONAL|SKIP)\]\s+{re.escape(category_name)}",
-        re.MULTILINE | re.IGNORECASE,
-    )
-    match = pattern.search(content)
-    if not match:
-        return files
-
-    # Look for relevant files line in the section
-    section_start = match.end()
-    section = content[section_start:section_start + 1000]  # Look ahead
-
-    for line in section.split("\n"):
-        if "relevant files" in line.lower() or "files" in line.lower():
-            # Extract backtick-wrapped file paths
-            file_matches = re.findall(r"`([^`]+\.\w+)`", line)
-            files.extend(file_matches)
-
-    return files
-
-
-def _recover_stale_state(
-    repo_path: Path,
-    state: AgentState,
-    target_branch: str,
-    fallback_branch: str,
-) -> None:
-    """Detect and recover from stale state before creating a new branch.
-
-    Handles two cases:
-      1. state.json stuck at 'in_progress' from a killed process
-      2. A branch named `target_branch` already exists (from a previous run)
-
-    Args:
-        repo_path: Target repository path.
-        state: Current agent state (will be mutated and saved if recovered).
-        target_branch: The branch name we're about to create.
-        fallback_branch: The branch to checkout if we need to clean up.
-    """
-    # Case 1: Orphaned in_progress state
-    if state.last_run_status == "in_progress":
-        logger.warning(
-            f"Previous run was interrupted (status: in_progress). "
-            f"Cleaning up stale branch '{state.current_branch}'..."
-        )
-        stale_branch = state.current_branch
-        if stale_branch and branch_exists(repo_path, stale_branch):
-            current = get_current_branch(repo_path)
-            if current == stale_branch:
-                reset_hard(repo_path)
-                checkout_branch(repo_path, fallback_branch)
-            delete_branch(repo_path, stale_branch, force=True)
-            logger.info(f"Deleted orphaned branch '{stale_branch}'")
-
-        state.last_run_status = "recovered"
-        state.current_branch = None
-        save_state(repo_path, state)
-
-    # Case 2: Target branch already exists (stale from a completed/aborted run)
-    if branch_exists(repo_path, target_branch):
-        logger.warning(
-            f"Stale branch '{target_branch}' already exists. Removing it..."
-        )
-        current = get_current_branch(repo_path)
-        if current == target_branch:
-            reset_hard(repo_path)
-            checkout_branch(repo_path, fallback_branch)
-        delete_branch(repo_path, target_branch, force=True)
-        logger.info(f"Removed stale branch '{target_branch}'")

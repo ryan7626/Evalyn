@@ -1,15 +1,71 @@
 """Shared data models for Evalyn.
 
-These are extracted to avoid circular imports between runner and reporter.
+All core result dataclasses live here to prevent circular imports and enforce
+clean layering: runner/* imports from models, never the other way around.
 """
 
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, Optional
 
-from evalyn.runner.test_executor import TestResult
-from evalyn.runner.fixer import FixAttempt
 
+# ---------------------------------------------------------------------------
+# TestResult — produced by runner/test_executor.py
+# ---------------------------------------------------------------------------
+
+@dataclass
+class TestResult:
+    """Result of a single test command execution."""
+
+    category: str
+    command: str
+    exit_code: int
+    stdout: str
+    stderr: str
+    duration_seconds: float
+    status: Literal["passed", "failed", "error", "timeout"]
+
+    @property
+    def is_success(self) -> bool:
+        return self.status == "passed"
+
+    @property
+    def failure_summary(self) -> str:
+        """Concise failure summary for logging and reports."""
+        if self.status == "passed":
+            return ""
+        if self.status == "timeout":
+            return f"Test timed out after {self.duration_seconds:.0f}s"
+        # Combine stderr and tail of stdout for context
+        output = self.stderr.strip() or self.stdout.strip()
+        lines = output.split("\n")
+        if len(lines) > 20:
+            output = "\n".join(lines[-20:])
+        return output
+
+
+# ---------------------------------------------------------------------------
+# FixAttempt — produced by runner/fixer.py
+# ---------------------------------------------------------------------------
+
+@dataclass
+class FixAttempt:
+    """Represents an attempted fix from the LLM."""
+
+    file_path: str
+    original_content: str
+    replacement_content: str
+    explanation: str
+    applied: bool = False
+    rejected_reason: Optional[str] = None
+    passed: bool = False
+    diff_size: int = 0
+    is_best_candidate: bool = False
+
+
+# ---------------------------------------------------------------------------
+# CategoryResult / RunResult — produced by runner/runner.py
+# ---------------------------------------------------------------------------
 
 @dataclass
 class CategoryResult:

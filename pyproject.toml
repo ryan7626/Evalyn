@@ -24,3 +24,12 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Prevent pytest from treating TestResult (a dataclass in models.py) as a test class
+python_classes = ["Test*"]
+python_files = ["test_*.py"]
+filterwarnings = [
+    "ignore::pytest.PytestCollectionWarning",
+]

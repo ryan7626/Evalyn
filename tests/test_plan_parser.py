@@ -5,10 +5,10 @@ from pathlib import Path
 
 import pytest
 
-from evalyn.runner.runner import (
-    _parse_plan_categories,
-    _parse_user_notes,
-    _apply_category_filters,
+from evalyn.runner.plan_reader import (
+    parse_plan_categories as _parse_plan_categories,
+    parse_user_notes as _parse_user_notes,
+    apply_category_filters as _apply_category_filters,
 )
 
 

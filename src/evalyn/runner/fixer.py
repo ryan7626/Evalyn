@@ -5,29 +5,15 @@ validates the fix against safety rules, and applies it.
 """
 
 import re
-from dataclasses import dataclass
+import sys
 from pathlib import Path
 from typing import Optional
 
 from evalyn.llm.base import BaseLLM
+from evalyn.models import FixAttempt
 from evalyn.utils.log import get_logger
 
 logger = get_logger("runner.fixer")
-
-
-@dataclass
-class FixAttempt:
-    """Represents an attempted fix from the LLM."""
-
-    file_path: str
-    original_content: str
-    replacement_content: str
-    explanation: str
-    applied: bool = False
-    rejected_reason: Optional[str] = None
-    passed: bool = False
-    diff_size: int = 0
-    is_best_candidate: bool = False
 
 
 SYSTEM_PROMPT = """\
@@ -218,7 +204,7 @@ def _process_fix_response(response: dict, repo_path: Path) -> FixAttempt:
 
 def apply_fix(fix: FixAttempt, repo_path: Path) -> bool:
     """Apply the validated fix to the filesystem.
-    
+
     Returns:
         True if successfully applied, False otherwise.
     """

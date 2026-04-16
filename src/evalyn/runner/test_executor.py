@@ -5,44 +5,12 @@ Runs test commands via subprocess and captures structured results.
 
 import subprocess
 import time
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
 
+from evalyn.models import TestResult
 from evalyn.utils.log import get_logger
 
 logger = get_logger("runner.test_executor")
-
-
-@dataclass
-class TestResult:
-    """Result of a single test command execution."""
-
-    category: str
-    command: str
-    exit_code: int
-    stdout: str
-    stderr: str
-    duration_seconds: float
-    status: Literal["passed", "failed", "error", "timeout"]
-
-    @property
-    def is_success(self) -> bool:
-        return self.status == "passed"
-
-    @property
-    def failure_summary(self) -> str:
-        """Concise failure summary for logging and reports."""
-        if self.status == "passed":
-            return ""
-        if self.status == "timeout":
-            return f"Test timed out after {self.duration_seconds:.0f}s"
-        # Combine stderr and tail of stdout for context
-        output = self.stderr.strip() or self.stdout.strip()
-        lines = output.split("\n")
-        if len(lines) > 20:
-            output = "\n".join(lines[-20:])
-        return output
 
 
 def run_test_command(

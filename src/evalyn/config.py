@@ -25,7 +25,7 @@ class Config:
 
     # LLM settings
     llm_provider: str = "claude"
-    llm_model: str = "claude-sonnet-4-20250514"
+    llm_model: str = "claude-3-5-sonnet-20241022"
 
     # Execution settings
     max_fix_retries: int = 3
@@ -70,6 +70,9 @@ def load_config(repo_path: Path) -> Config:
         claude_md_content = claude_md_path.read_text(encoding="utf-8")
     except OSError as e:
         raise ConfigError(f"Failed to read CLAUDE.md: {e}")
+
+    if not claude_md_content.strip():
+        raise ConfigError(f"CLAUDE.md is empty: {claude_md_path}")
 
     # Start with defaults
     config = Config(
