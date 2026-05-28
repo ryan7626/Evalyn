@@ -1,6 +1,6 @@
 # Evalyn
 
-Evalyn is your overnight testing and repair partner for monorepos.
+Evalyn is your overnight evaluation, testing and repair partner for monorepos.
 
 Instead of waiting for CI/CD loops to fail, or writing tests at the end of a long day, you just tell Evalyn what you changed. You go to sleep. Evalyn runs the tests on a completely isolated branch, safely iterates on fixes if things break, and leaves a morning report summarizing what works and what needs your attention.
 
