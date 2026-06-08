@@ -10,6 +10,7 @@ from evalyn.runner.plan_reader import (
     parse_user_notes,
     apply_category_filters,
     extract_files_for_category,
+    extract_category_metadata,
 )
 
 
@@ -83,6 +84,46 @@ class TestExtractFilesForCategory:
         assert "src/auth.ts" in files
 
 
+# ── extract_category_metadata ────────────────────────────────────────────────
+
+
+class TestExtractCategoryMetadata:
+    def test_extracts_rich_plan_metadata(self, plan):
+        p = plan("""\
+            ### [REQUIRED] Auth Tests
+
+            - **Description**: Auth behavior changed.
+            - **Risk level**: high
+            - **Why this matters**: Login can break.
+            - **Affected surface**: Session handling
+            - **Relevant files**: `src/auth.ts`
+            - **Success criteria**: Auth tests pass.
+            - **Suggested commands**:
+              - `pytest tests/auth.py`
+        """)
+
+        metadata = extract_category_metadata(p, "Auth Tests")
+
+        assert metadata["priority"] == "required"
+        assert metadata["description"] == "Auth behavior changed."
+        assert metadata["risk_level"] == "high"
+        assert metadata["plan_reason"] == "Login can break."
+        assert metadata["affected_surface"] == "Session handling"
+        assert metadata["success_criteria"] == "Auth tests pass."
+
+    def test_missing_metadata_returns_empty_fields(self, plan):
+        p = plan("""\
+            ### [REQUIRED] Auth Tests
+
+            - `pytest`
+        """)
+
+        metadata = extract_category_metadata(p, "Missing")
+
+        assert metadata["priority"] == ""
+        assert metadata["description"] == ""
+
+
 # ── parse_plan_categories (public-name re-test for plan_reader module) ───────
 
 
@@ -125,6 +166,17 @@ class TestParsePlanCategoriesModule:
         """)
         cats = parse_plan_categories(p)
         assert cats[0][1] == []
+
+    def test_metadata_backticks_are_not_parsed_as_commands(self, plan):
+        p = plan("""\
+            ### [REQUIRED] Auth Tests
+
+            - **Success criteria**: `pytest tests/auth.py` passes cleanly.
+            - **Suggested commands**:
+              - `pytest tests/unit.py`
+        """)
+        cats = parse_plan_categories(p)
+        assert cats[0][1] == ["pytest tests/unit.py"]
 
 
 # ── apply_category_filters (spot checks for public rename) ───────────────────

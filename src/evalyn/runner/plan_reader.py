@@ -65,7 +65,15 @@ def parse_plan_categories(plan_path: Path) -> list[tuple[str, list[str], str]]:
         # Find commands (list items that contain a backtick-wrapped command)
         commands = []
         for line in section.split("\n"):
-            if "relevant files" in line.lower() or "description" in line.lower():
+            line_lower = line.lower()
+            if any(label in line_lower for label in (
+                "description",
+                "risk level",
+                "why this matters",
+                "affected surface",
+                "relevant files",
+                "success criteria",
+            )):
                 continue
             # Match lines like:  - `pytest tests/auth/`
             cmd_match = re.search(r"`([^`]+)`", line)
@@ -80,6 +88,79 @@ def parse_plan_categories(plan_path: Path) -> list[tuple[str, list[str], str]]:
         categories.append((name, commands, priority))
 
     return categories
+
+
+def extract_category_metadata(plan_path: Path, category_name: str) -> dict[str, str]:
+    """Extract plan metadata for a category.
+
+    Returns fields such as description, risk level, affected surface, and
+    success criteria when they are present. Missing fields are returned as
+    empty strings so older plan files remain valid.
+    """
+    content = plan_path.read_text(encoding="utf-8")
+    found = _find_category_section(content, category_name)
+    metadata = {
+        "priority": "",
+        "description": "",
+        "risk_level": "",
+        "plan_reason": "",
+        "affected_surface": "",
+        "success_criteria": "",
+    }
+    if found is None:
+        return metadata
+
+    priority, section = found
+    metadata["priority"] = priority
+
+    label_map = {
+        "description": "description",
+        "risk level": "risk_level",
+        "why this matters": "plan_reason",
+        "affected surface": "affected_surface",
+        "success criteria": "success_criteria",
+    }
+
+    for line in section.splitlines():
+        match = re.match(r"\s*-\s+\*\*([^*]+)\*\*:\s*(.*)$", line)
+        if not match:
+            continue
+        label = match.group(1).strip().lower()
+        key = label_map.get(label)
+        if key:
+            metadata[key] = _clean_metadata_value(match.group(2).strip())
+
+    return metadata
+
+
+def _find_category_section(
+    content: str,
+    category_name: str,
+) -> tuple[str, str] | None:
+    """Find a category section and return (priority, body)."""
+    category_pattern = re.compile(
+        r"^###\s+\[(REQUIRED|OPTIONAL|SKIP)\]\s+(.+)$",
+        re.MULTILINE | re.IGNORECASE,
+    )
+    matches = list(category_pattern.finditer(content))
+    target = category_name.lower()
+
+    for i, match in enumerate(matches):
+        name = match.group(2).strip()
+        if name.lower() != target:
+            continue
+        start = match.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(content)
+        return match.group(1).lower(), content[start:end]
+
+    return None
+
+
+def _clean_metadata_value(value: str) -> str:
+    """Strip light markdown wrappers from one-line metadata values."""
+    if value in {"_none specified_", "_No test commands suggested — manual review needed_"}:
+        return ""
+    return value.strip().strip("_")
 
 
 def parse_user_notes(plan_path: Path) -> dict:

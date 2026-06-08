@@ -68,7 +68,11 @@ CATEGORY_TEMPLATE = """\
 ### [{priority}] {name}
 
 - **Description**: {description}
+- **Risk level**: {risk_level}
+- **Why this matters**: {reason}
+- **Affected surface**: {affected_surface}
 - **Relevant files**: {relevant_files}
+- **Success criteria**: {success_criteria}
 - **Suggested commands**:
 {commands_list}
 """
@@ -205,7 +209,11 @@ def _render_category(cat: TestCategory) -> str:
         priority=cat.priority.upper(),
         name=cat.name,
         description=cat.description,
+        risk_level=cat.risk_level,
+        reason=cat.reason or "Directly related to the changed files.",
+        affected_surface=cat.affected_surface or "Unspecified",
         relevant_files=relevant,
+        success_criteria=cat.success_criteria or "Suggested commands pass without new failures.",
         commands_list=commands,
     )
 

@@ -23,6 +23,10 @@ class TestCategory:
     relevant_files: list[str]
     suggested_test_commands: list[str]
     priority: str  # "required" | "optional"
+    risk_level: str = "medium"  # "high" | "medium" | "low"
+    affected_surface: str = ""
+    reason: str = ""
+    success_criteria: str = ""
 
 
 SYSTEM_PROMPT = """\
@@ -47,6 +51,8 @@ and set the priority to "optional".
 - Categories should be specific (e.g., "Auth Session Handling") not vague (e.g., "Backend").
 - Required categories are those where changes are significant and testing is essential.
 - Optional categories are for minor changes or areas where test coverage is uncertain.
+- Risk level should reflect likely user impact and blast radius: "high", "medium", or "low".
+- Success criteria should state what passing evidence would make the result actionable.
 """
 
 USER_PROMPT_TEMPLATE = """\
@@ -76,6 +82,10 @@ Each category object must have these fields:
 - "relevant_files": string[] — which changed files relate to this category
 - "suggested_test_commands": string[] — commands to run to test this category
 - "priority": "required" | "optional"
+- "risk_level": "high" | "medium" | "low"
+- "affected_surface": string — the product or system area likely affected
+- "reason": string — why this category matters for the changed code
+- "success_criteria": string — what evidence should count as a useful pass
 
 Respond with ONLY the JSON array. Example:
 [
@@ -84,7 +94,11 @@ Respond with ONLY the JSON array. Example:
     "description": "Login flow modified, session token validation changed",
     "relevant_files": ["src/auth/login.ts", "src/auth/session.ts"],
     "suggested_test_commands": ["npm test -- --grep auth"],
-    "priority": "required"
+    "priority": "required",
+    "risk_level": "high",
+    "affected_surface": "Authentication and session renewal",
+    "reason": "Session validation changes can block login or expose stale sessions.",
+    "success_criteria": "Auth tests cover login, token refresh, and invalid session rejection."
   }}
 ]
 """
@@ -182,12 +196,24 @@ def _parse_categories(raw: dict | list) -> list[TestCategory]:
                 relevant_files=item.get("relevant_files", []),
                 suggested_test_commands=item.get("suggested_test_commands", []),
                 priority=str(item.get("priority", "optional")).lower(),
+                risk_level=_normalize_risk_level(item.get("risk_level")),
+                affected_surface=str(item.get("affected_surface", "")),
+                reason=str(item.get("reason", "")),
+                success_criteria=str(item.get("success_criteria", "")),
             ))
         except (TypeError, ValueError) as e:
             logger.warning(f"Skipping malformed category: {e}")
             continue
 
     return categories
+
+
+def _normalize_risk_level(value: object) -> str:
+    """Return a valid risk level for plan/report metadata."""
+    risk = str(value or "medium").lower()
+    if risk not in {"high", "medium", "low"}:
+        return "medium"
+    return risk
 
 
 def _fallback_category(changeset: ChangeSet) -> TestCategory:
@@ -201,4 +227,8 @@ def _fallback_category(changeset: ChangeSet) -> TestCategory:
         relevant_files=changeset.files_changed,
         suggested_test_commands=[],
         priority="required",
+        risk_level="medium",
+        affected_surface="Changed files",
+        reason="LLM inference failed, so Evalyn cannot narrow the risk surface.",
+        success_criteria="A human reviews the fallback plan and adds the right test commands.",
     )
