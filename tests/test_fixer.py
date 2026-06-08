@@ -11,6 +11,7 @@ from evalyn.runner.fixer import (
     apply_fix,
     _read_source_files,
     _process_fix_response,
+    write_suggested_patch,
 )
 
 
@@ -209,10 +210,14 @@ class TestProcessFixResponse:
             "original_content": "return 1",
             "replacement_content": "return 42",
             "explanation": "fix the value",
+            "confidence": "high",
+            "diagnosis": "root_cause",
         }
         fix = _process_fix_response(response, self.repo)
         assert fix.file_path == "source.py"
         assert fix.rejected_reason is None
+        assert fix.confidence == "high"
+        assert fix.diagnosis == "root_cause"
 
     def test_diff_size_is_computed(self):
         response = {
@@ -223,3 +228,37 @@ class TestProcessFixResponse:
         }
         fix = _process_fix_response(response, self.repo)
         assert fix.diff_size == 3  # abs(5 - 2)
+
+
+class TestWriteSuggestedPatch:
+    def test_writes_patch_without_modifying_source(self, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "source.py").write_text("def foo():\n    return 1\n", encoding="utf-8")
+        fix = FixAttempt(
+            file_path="source.py",
+            original_content="return 1",
+            replacement_content="return 42",
+            explanation="fix value",
+        )
+
+        assert write_suggested_patch(fix, repo, tmp_path / "patches", "auth fix") is True
+
+        assert "return 1" in (repo / "source.py").read_text(encoding="utf-8")
+        assert fix.suggested_only is True
+        assert Path(fix.suggested_patch_path).is_file()
+        assert "return 42" in Path(fix.suggested_patch_path).read_text(encoding="utf-8")
+
+    def test_rejects_missing_original_content(self, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "source.py").write_text("def foo():\n    return 1\n", encoding="utf-8")
+        fix = FixAttempt(
+            file_path="source.py",
+            original_content="return 99",
+            replacement_content="return 42",
+            explanation="fix value",
+        )
+
+        assert write_suggested_patch(fix, repo, tmp_path / "patches", "auth") is False
+        assert "not found" in fix.rejected_reason

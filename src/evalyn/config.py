@@ -31,6 +31,7 @@ class Config:
     max_fix_retries: int = 3
     test_timeout_seconds: int = 300
     max_output_lines: int = 200  # max test output lines to send to LLM
+    repair_mode: str = "apply_unstaged"
 
     # Service settings
     services: list[dict] = field(default_factory=list)
@@ -127,6 +128,16 @@ def _apply_overrides(config: Config, overrides: dict) -> None:
                         f"Invalid value for {key} in .agent/config.yaml: "
                         f"{execution[key]!r} (expected an integer)"
                     )
+        if "repair_mode" in execution:
+            repair_mode = str(execution["repair_mode"])
+            allowed = {"apply_unstaged", "suggest_patches", "test_only"}
+            if repair_mode not in allowed:
+                choices = ", ".join(sorted(allowed))
+                raise ConfigError(
+                    f"Invalid value for repair_mode in .agent/config.yaml: "
+                    f"{repair_mode!r} (expected one of: {choices})"
+                )
+            config.repair_mode = repair_mode
 
     services = overrides.get("services", [])
     if isinstance(services, list):

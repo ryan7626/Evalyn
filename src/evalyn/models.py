@@ -56,11 +56,16 @@ class FixAttempt:
     original_content: str
     replacement_content: str
     explanation: str
+    confidence: str = "unknown"
+    diagnosis: str = "unknown"
     applied: bool = False
     rejected_reason: Optional[str] = None
     passed: bool = False
     diff_size: int = 0
     is_best_candidate: bool = False
+    suggested_only: bool = False
+    suggested_patch_path: str = ""
+    rolled_back: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -73,6 +78,14 @@ class CategoryResult:
 
     name: str
     status: Literal["passed", "failed", "uncertain", "skipped"]
+    priority: str = ""
+    risk_level: str = ""
+    description: str = ""
+    affected_surface: str = ""
+    success_criteria: str = ""
+    plan_reason: str = ""
+    repair_outcome: str = "none"
+    next_action: str = ""
     test_results: list[TestResult] = field(default_factory=list)
     fix_attempts: list[FixAttempt] = field(default_factory=list)
     generated_tests: list[str] = field(default_factory=list)

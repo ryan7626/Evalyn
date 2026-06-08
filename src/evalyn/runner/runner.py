@@ -15,12 +15,13 @@ from evalyn.config import Config
 from evalyn.llm.base import BaseLLM
 from evalyn.models import CategoryResult, RunResult
 from evalyn.planner.planner import check_plan_approved
-from evalyn.runner.fixer import generate_fix, apply_fix
+from evalyn.runner.fixer import generate_fix, apply_fix, write_suggested_patch
 from evalyn.runner.plan_reader import (
     parse_plan_categories,
     parse_user_notes,
     apply_category_filters,
     extract_files_for_category,
+    extract_category_metadata,
     recover_stale_state,
 )
 from evalyn.runner.rollback import RollbackManager
@@ -105,6 +106,7 @@ def run_execution_phase(
     if not all_categories:
         logger.error("No test categories found in the approved plan.")
         return None
+    priority_by_name = {name: priority for name, _, priority in all_categories}
 
     # Parse user notes for directives
     user_directives = parse_user_notes(plan_path)
@@ -135,16 +137,25 @@ def run_execution_phase(
         logger.info("Dry run — no branch created, no tests executed.")
         dry_result = RunResult(timestamp=timestamp, branch="(dry-run)", run_dir=run_dir)
         for cat_name, _, priority in categories:
+            metadata = extract_category_metadata(plan_path, cat_name)
             dry_result.category_results.append(CategoryResult(
                 name=cat_name,
                 status="skipped",
+                **_category_metadata_kwargs(metadata, priority),
                 error_message=f"Dry run — would execute [{priority.upper()}]",
+                next_action="Run without --dry-run to execute this category.",
             ))
         for skip_name, reason in skipped:
+            metadata = extract_category_metadata(plan_path, skip_name)
             dry_result.category_results.append(CategoryResult(
                 name=skip_name,
                 status="skipped",
+                **_category_metadata_kwargs(
+                    metadata,
+                    priority_by_name.get(skip_name, metadata.get("priority", "")),
+                ),
                 error_message=reason,
+                next_action="No action unless this category should be included.",
             ))
         return dry_result
 
@@ -197,10 +208,16 @@ def run_execution_phase(
 
     # Record skipped categories in the result
     for skip_name, skip_reason in skipped:
+        metadata = extract_category_metadata(plan_path, skip_name)
         run_result.category_results.append(CategoryResult(
             name=skip_name,
             status="skipped",
+            **_category_metadata_kwargs(
+                metadata,
+                priority_by_name.get(skip_name, metadata.get("priority", "")),
+            ),
             error_message=skip_reason,
+            next_action="No action unless this category should be included.",
         ))
 
     try:
@@ -217,6 +234,7 @@ def run_execution_phase(
                 category_name=cat_name,
                 commands=cat_commands,
                 relevant_files=extract_files_for_category(plan_path, cat_name),
+                category_metadata=extract_category_metadata(plan_path, cat_name),
                 run_dir=run_dir,
                 priority=priority,
                 base_url=base_url,
@@ -306,13 +324,18 @@ def _execute_category(
     category_name: str,
     commands: list[str],
     relevant_files: list[str],
+    category_metadata: dict[str, str],
     run_dir: Path,
     priority: str,
     base_url: str | None = None,
 ) -> CategoryResult:
     """Execute all test commands for a single category with fix loop."""
 
-    cat_result = CategoryResult(name=category_name, status="passed")
+    cat_result = CategoryResult(
+        name=category_name,
+        status="passed",
+        **_category_metadata_kwargs(category_metadata, priority),
+    )
 
     if priority == "required" and not commands:
         logger.info(
@@ -364,6 +387,8 @@ def _execute_category(
         except Exception as e:
             logger.error(f"Failed to generate ephemeral test: {e}")
             cat_result.status = "uncertain"
+            cat_result.repair_outcome = "none"
+            cat_result.next_action = "Add a concrete test command or inspect why test generation failed."
             cat_result.error_message = (
                 f"Missing required test coverage and generation failed: {e}"
             )
@@ -385,6 +410,29 @@ def _execute_category(
 
         # Test failed — enter fix loop
         logger.warning(f"Test failed: {command}")
+
+        if config.repair_mode == "test_only":
+            cat_result.status = "failed"
+            cat_result.repair_outcome = "disabled"
+            cat_result.next_action = "Inspect the failing test; repair was disabled by config."
+            cat_result.error_message = (
+                "Repair mode is test_only, so Evalyn did not attempt a fix."
+            )
+            break
+
+        if config.repair_mode == "suggest_patches":
+            _suggest_patch_for_failure(
+                config=config,
+                llm=llm,
+                repo_path=repo_path,
+                category_name=category_name,
+                command=command,
+                test_result=test_result,
+                relevant_files=relevant_files,
+                run_dir=run_dir,
+                cat_result=cat_result,
+            )
+            break
 
         fixed = False
         previous_attempts_context = ""
@@ -439,6 +487,8 @@ def _execute_category(
             if fix.passed:
                 logger.info(f"Fix successful on attempt {attempt_num}! Fast-exiting the bounded search.")
                 fix.is_best_candidate = True
+                cat_result.repair_outcome = "applied_passed"
+                cat_result.next_action = "Review the unstaged fix before accepting it."
                 fixed = True
                 # Leave snapshot/applied fix intact
                 break
@@ -449,6 +499,8 @@ def _execute_category(
                 )
                 # Rollback precisely to baseline for a clean next attempt
                 rollback.rollback_last()
+                fix.rolled_back = True
+                cat_result.repair_outcome = "applied_failed"
 
                 # Feedback loop: Store the hypothesis and its specific error
                 previous_attempts_context += (
@@ -460,6 +512,11 @@ def _execute_category(
 
         if not fixed:
             cat_result.status = "uncertain"
+            if cat_result.repair_outcome == "none":
+                cat_result.repair_outcome = (
+                    "declined" if cat_result.fix_attempts else "none"
+                )
+            cat_result.next_action = "Inspect the failing test and rejected or rolled-back fix attempts."
             cat_result.error_message = (
                 f"Failed after {config.max_fix_retries} fix attempts. "
                 f"Marked as uncertain for human review."
@@ -482,4 +539,93 @@ def _execute_category(
             except Exception as e:
                 logger.warning(f"Failed to remove ephemeral test {gen_test}: {e}")
 
+    if cat_result.status == "passed" and cat_result.repair_outcome == "none":
+        cat_result.repair_outcome = "not_needed"
+
     return cat_result
+
+
+def _suggest_patch_for_failure(
+    config: Config,
+    llm: BaseLLM,
+    repo_path: Path,
+    category_name: str,
+    command: str,
+    test_result,
+    relevant_files: list[str],
+    run_dir: Path,
+    cat_result: CategoryResult,
+) -> None:
+    """Generate patch suggestions without changing the working tree."""
+    previous_attempts_context = ""
+    wrote_patch = False
+
+    for attempt_num in range(1, config.max_fix_retries + 1):
+        logger.info(
+            f"Patch suggestion hypothesis {attempt_num}/{config.max_fix_retries} "
+            f"for '{category_name}'"
+        )
+        fix = generate_fix(
+            llm=llm,
+            repo_path=repo_path,
+            category=category_name,
+            command=command,
+            exit_code=test_result.exit_code,
+            stdout=test_result.stdout,
+            stderr=test_result.stderr,
+            claude_md_content=config.claude_md_content,
+            relevant_files=relevant_files,
+            previous_attempts_context=previous_attempts_context,
+        )
+        cat_result.fix_attempts.append(fix)
+
+        if fix.rejected_reason:
+            previous_attempts_context += (
+                f"### Attempt {attempt_num} Failed to Produce a Valid Patch\n"
+                f"Reason: {fix.rejected_reason}\n\n"
+            )
+            continue
+
+        wrote_patch = write_suggested_patch(
+            fix,
+            repo_path,
+            run_dir / "suggested-patches",
+            f"{category_name}_{attempt_num}",
+        )
+        if wrote_patch:
+            break
+
+        previous_attempts_context += (
+            f"### Attempt {attempt_num} Failed to Write Patch\n"
+            f"Reason: {fix.rejected_reason}\n\n"
+        )
+
+    cat_result.status = "uncertain"
+    cat_result.repair_outcome = "suggested" if wrote_patch else "declined"
+    if wrote_patch:
+        cat_result.next_action = "Review the suggested patch and apply it manually if appropriate."
+        cat_result.error_message = (
+            "Repair mode is suggest_patches, so Evalyn wrote a patch suggestion "
+            "without changing the working tree."
+        )
+    else:
+        cat_result.next_action = "Inspect the failure; Evalyn could not produce a valid patch suggestion."
+        cat_result.error_message = (
+            "Repair mode is suggest_patches, but no valid patch suggestion was produced."
+        )
+
+
+def _category_metadata_kwargs(
+    metadata: dict[str, str] | None,
+    priority: str = "",
+) -> dict[str, str]:
+    """Build CategoryResult metadata kwargs from plan metadata."""
+    metadata = metadata or {}
+    return {
+        "priority": priority or metadata.get("priority", ""),
+        "risk_level": metadata.get("risk_level", ""),
+        "description": metadata.get("description", ""),
+        "affected_surface": metadata.get("affected_surface", ""),
+        "success_criteria": metadata.get("success_criteria", ""),
+        "plan_reason": metadata.get("plan_reason", ""),
+    }

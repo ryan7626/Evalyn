@@ -6,6 +6,7 @@ validates the fix against safety rules, and applies it.
 
 import re
 import sys
+import difflib
 from pathlib import Path
 from typing import Optional
 
@@ -33,6 +34,7 @@ Rules:
 - If you are not confident in the fix, say so in the explanation.
 - If the failure seems to be an environment issue (not a code bug), explain that and provide no fix.
 - Simpler is better. A minimal modification that resolves the failure is preferred.
+- Classify the fix as "root_cause", "symptom_patch", or "unknown".
 """
 
 USER_PROMPT_TEMPLATE = """\
@@ -70,7 +72,8 @@ Analyze the failure and produce a fix. Respond with JSON:
   "original_content": "exact text to find in the file",
   "replacement_content": "exact replacement text",
   "explanation": "why this fix should resolve the failure",
-  "confidence": "high" | "medium" | "low"
+  "confidence": "high" | "medium" | "low",
+  "diagnosis": "root_cause" | "symptom_patch" | "unknown"
 }}
 
 If you cannot produce a fix (e.g., environment issue, unclear failure), respond with:
@@ -80,7 +83,8 @@ If you cannot produce a fix (e.g., environment issue, unclear failure), respond 
   "original_content": null,
   "replacement_content": null,
   "explanation": "why no fix is possible",
-  "confidence": "none"
+  "confidence": "none",
+  "diagnosis": "unknown"
 }}
 """
 
@@ -171,6 +175,8 @@ def _process_fix_response(response: dict, repo_path: Path) -> FixAttempt:
     original = response.get("original_content")
     replacement = response.get("replacement_content")
     explanation = response.get("explanation", "")
+    confidence = _normalize_confidence(response.get("confidence"))
+    diagnosis = _normalize_diagnosis(response.get("diagnosis"))
 
     # No fix suggested
     if file_path is None or original is None:
@@ -180,6 +186,8 @@ def _process_fix_response(response: dict, repo_path: Path) -> FixAttempt:
             original_content="",
             replacement_content="",
             explanation=explanation,
+            confidence=confidence,
+            diagnosis=diagnosis,
             applied=False,
             rejected_reason="LLM declined",
         )
@@ -189,6 +197,8 @@ def _process_fix_response(response: dict, repo_path: Path) -> FixAttempt:
         original_content=original,
         replacement_content=replacement,
         explanation=explanation,
+        confidence=confidence,
+        diagnosis=diagnosis,
         diff_size=abs(len(replacement or "") - len(original or ""))
     )
 
@@ -200,6 +210,57 @@ def _process_fix_response(response: dict, repo_path: Path) -> FixAttempt:
         logger.warning(f"Fix validation rejected: {rejection}")
 
     return fix
+
+
+def write_suggested_patch(
+    fix: FixAttempt,
+    repo_path: Path,
+    patches_dir: Path,
+    name: str,
+) -> bool:
+    """Write a patch suggestion without changing the working tree."""
+    if fix.rejected_reason:
+        return False
+
+    rejection = _validate_fix(fix, repo_path)
+    if rejection:
+        fix.rejected_reason = rejection
+        logger.warning(f"Patch suggestion rejected: {rejection}")
+        return False
+
+    full_path = repo_path / fix.file_path
+    try:
+        content = full_path.read_text(encoding="utf-8")
+        if fix.original_content not in content:
+            fix.rejected_reason = "Original content not found in file"
+            logger.warning(f"Patch suggestion rejected: original content not found in {fix.file_path}")
+            return False
+
+        new_content = content.replace(fix.original_content, fix.replacement_content, 1)
+        patch_lines = difflib.unified_diff(
+            content.splitlines(keepends=True),
+            new_content.splitlines(keepends=True),
+            fromfile=f"a/{fix.file_path}",
+            tofile=f"b/{fix.file_path}",
+        )
+        patch_text = "".join(patch_lines)
+        if not patch_text.strip():
+            fix.rejected_reason = "Suggested patch was empty"
+            return False
+
+        patches_dir.mkdir(parents=True, exist_ok=True)
+        safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("_") or "fix"
+        patch_path = patches_dir / f"{safe_name}.patch"
+        patch_path.write_text(patch_text, encoding="utf-8")
+        fix.suggested_only = True
+        fix.suggested_patch_path = str(patch_path)
+        logger.info(f"Patch suggestion written: {patch_path}")
+        return True
+
+    except OSError as e:
+        fix.rejected_reason = f"File I/O error: {e}"
+        logger.error(f"Failed to write patch suggestion: {e}")
+        return False
 
 
 def apply_fix(fix: FixAttempt, repo_path: Path) -> bool:
@@ -263,6 +324,20 @@ def _validate_fix(fix: FixAttempt, repo_path: Path) -> Optional[str]:
         return "Original and replacement content are identical"
 
     return None
+
+
+def _normalize_confidence(value: object) -> str:
+    confidence = str(value or "unknown").lower()
+    if confidence not in {"high", "medium", "low", "none", "unknown"}:
+        return "unknown"
+    return confidence
+
+
+def _normalize_diagnosis(value: object) -> str:
+    diagnosis = str(value or "unknown").lower()
+    if diagnosis not in {"root_cause", "symptom_patch", "unknown"}:
+        return "unknown"
+    return diagnosis
 
 
 def _read_source_files(

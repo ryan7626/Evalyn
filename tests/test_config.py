@@ -85,6 +85,10 @@ class TestLoadConfig:
         config = load_config(repo)
         assert config.services == []
 
+    def test_default_repair_mode_applies_unstaged(self, repo):
+        config = load_config(repo)
+        assert config.repair_mode == "apply_unstaged"
+
 
 class TestApplyOverrides:
     def _make_config(self) -> Config:
@@ -115,6 +119,16 @@ class TestApplyOverrides:
         config = self._make_config()
         _apply_overrides(config, {"execution": {"max_output_lines": 50}})
         assert config.max_output_lines == 50
+
+    def test_repair_mode_overridden(self):
+        config = self._make_config()
+        _apply_overrides(config, {"execution": {"repair_mode": "suggest_patches"}})
+        assert config.repair_mode == "suggest_patches"
+
+    def test_invalid_repair_mode_raises(self):
+        config = self._make_config()
+        with pytest.raises(ConfigError, match="repair_mode"):
+            _apply_overrides(config, {"execution": {"repair_mode": "auto_commit"}})
 
     def test_services_overridden(self):
         config = self._make_config()
