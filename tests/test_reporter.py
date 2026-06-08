@@ -121,6 +121,29 @@ class TestRenderCategoryResult:
         lines = _render_category_result(cat)
         assert any("auth.py" in l for l in lines)
 
+    def test_repaired_pass_has_review_next_action(self):
+        cat = CategoryResult(
+            name="Auth",
+            status="passed",
+            repair_outcome="applied_passed",
+        )
+        lines = _render_category_result(cat)
+        assert any("Review the unstaged fix" in l for l in lines)
+
+    def test_rich_metadata_shown(self):
+        cat = CategoryResult(
+            name="Auth",
+            status="passed",
+            priority="required",
+            risk_level="high",
+            affected_surface="Sessions",
+            success_criteria="Auth tests pass.",
+            plan_reason="Login can break.",
+        )
+        lines = _render_category_result(cat)
+        assert any("Risk: high" in l for l in lines)
+        assert any("Sessions" in l for l in lines)
+
     def test_rejected_fix_shown(self):
         cat = CategoryResult(name="Auth", status="uncertain")
         fix = FixAttempt(
@@ -160,11 +183,13 @@ class TestGenerateReports:
         run_result.category_results.append(CategoryResult(name="A", status="passed"))
         run_result.category_results.append(CategoryResult(name="B", status="failed"))
         run_result.category_results.append(CategoryResult(name="C", status="uncertain"))
+        run_result.category_results.append(CategoryResult(name="D", status="skipped"))
         _, json_path = generate_reports(run_result)
         data = json.loads(json_path.read_text())
         assert data["summary"]["passed"] == 1
         assert data["summary"]["failed"] == 1
         assert data["summary"]["uncertain"] == 1
+        assert data["summary"]["skipped"] == 1
 
     def test_markdown_contains_timestamp(self, tmp_path):
         run_result = _make_run_result(_make_run_dir(tmp_path))
@@ -175,6 +200,14 @@ class TestGenerateReports:
         run_result = _make_run_result(_make_run_dir(tmp_path))
         md_path, _ = generate_reports(run_result)
         assert "evalyn/test" in md_path.read_text()
+
+    def test_markdown_contains_morning_decision(self, tmp_path):
+        run_result = _make_run_result(_make_run_dir(tmp_path))
+        run_result.category_results.append(CategoryResult(name="A", status="passed"))
+        md_path, _ = generate_reports(run_result)
+        content = md_path.read_text()
+        assert "Morning Decision" in content
+        assert "No immediate action" in content
 
     def test_json_branch_recorded(self, tmp_path):
         run_result = _make_run_result(_make_run_dir(tmp_path))
@@ -202,3 +235,21 @@ class TestGenerateReports:
         run_result.category_results.append(cat)
         md_path, _ = generate_reports(run_result)
         assert "src/auth.py" in md_path.read_text()
+
+    def test_rolled_back_fix_not_listed_as_modified(self, tmp_path):
+        run_dir = _make_run_dir(tmp_path)
+        run_result = _make_run_result(run_dir)
+        cat = CategoryResult(name="A", status="uncertain")
+        fix = FixAttempt(
+            file_path="src/auth.py",
+            original_content="a",
+            replacement_content="b",
+            explanation="fix",
+            applied=True,
+            rolled_back=True,
+        )
+        cat.fix_attempts.append(fix)
+        run_result.category_results.append(cat)
+        md_path, _ = generate_reports(run_result)
+        content = md_path.read_text()
+        assert "No files were modified" in content
