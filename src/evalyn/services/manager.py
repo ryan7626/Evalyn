@@ -63,9 +63,12 @@ class ServiceManager:
         for svc_dict in services:
             svc = ServiceDef(
                 name=svc_dict.get("name", "unknown"),
-                command=svc_dict.get("command", ""),
+                command=svc_dict.get("command") or svc_dict.get("start", ""),
                 port=svc_dict.get("port"),
-                health_check_url=svc_dict.get("health_check_url"),
+                health_check_url=(
+                    svc_dict.get("health_check_url")
+                    or svc_dict.get("health_check")
+                ),
                 startup_timeout_seconds=svc_dict.get("startup_timeout_seconds", 30),
                 cwd=svc_dict.get("cwd"),
             )

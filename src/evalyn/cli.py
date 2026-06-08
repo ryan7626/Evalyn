@@ -402,9 +402,9 @@ _CLAUDE_MD_TEMPLATE = """\
 <!-- Services that must be running for integration tests. Example:
 services:
   - name: backend
-    start: npm run dev
+    command: npm run dev
     port: 3000
-    health_check: http://localhost:3000/health
+    health_check_url: http://localhost:3000/health
 -->
 """
 
@@ -425,9 +425,9 @@ _CONFIG_YAML_TEMPLATE = """\
 # Services to start before testing
 # services:
 #   - name: backend
-#     start: npm run dev
+#     command: npm run dev
 #     port: 3000
-#     health_check: http://localhost:3000/health
+#     health_check_url: http://localhost:3000/health
 """
 
 
