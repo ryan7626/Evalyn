@@ -64,7 +64,7 @@ class OpenRouterProvider(BaseLLM):
         user_prompt: str,
         *,
         max_tokens: int = 4096,
-    ) -> dict:
+    ) -> dict | list:
         """Generate a structured JSON completion via OpenRouter.
 
         Appends JSON instruction to system prompt and parses the response.

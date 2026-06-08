@@ -13,7 +13,7 @@ class BaseLLM(ABC):
 
     Provides two completion methods:
     - complete(): returns freeform text
-    - complete_json(): returns parsed JSON dict
+    - complete_json(): returns a parsed JSON value
     """
 
     @abstractmethod
@@ -43,7 +43,7 @@ class BaseLLM(ABC):
         user_prompt: str,
         *,
         max_tokens: int = 4096,
-    ) -> dict:
+    ) -> dict | list:
         """Generate a structured JSON completion.
 
         Args:
@@ -53,7 +53,7 @@ class BaseLLM(ABC):
             max_tokens: Maximum tokens in the response.
 
         Returns:
-            Parsed JSON dict from the model's response.
+            Parsed JSON value from the model's response.
 
         Raises:
             ValueError: If the model's response cannot be parsed as JSON.
