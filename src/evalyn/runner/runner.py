@@ -128,6 +128,8 @@ def run_execution_phase(
         for name, reason in skipped:
             logger.info(f"  ⏭ {name} — {reason}")
 
+    timestamp = run_dir.name
+
     # Dry run: show what would execute and return a summary result
     if dry_run:
         logger.info("Dry run — no branch created, no tests executed.")
@@ -150,7 +152,6 @@ def run_execution_phase(
     _prev_sigterm = signal.signal(signal.SIGTERM, _sigterm_handler)
 
     # Create a new branch for this run
-    timestamp = run_dir.name
     branch_name = f"evalyn/{timestamp}"
 
     original_branch = get_current_branch(config.repo_path)
