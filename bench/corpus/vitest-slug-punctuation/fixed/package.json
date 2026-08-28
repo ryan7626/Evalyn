@@ -1,0 +1,9 @@
+{
+  "name": "evalyn-bench-vitest-slug-fixed",
+  "private": true,
+  "type": "module",
+  "devDependencies": {
+    "vitest": "2.1.9"
+  }
+}
+

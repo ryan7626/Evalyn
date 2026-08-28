@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "description": "Causal base-pass, buggy-fail, fixed-pass fixtures for Evalyn adapters.",
+  "promotion_gate": {
+    "target_cases": 60,
+    "implemented_cases": 2,
+    "met": false
+  },
+  "cases": [
+    {
+      "id": "pytest-discount-rounding",
+      "framework": "pytest",
+      "summary": "Detect a one-cent regression caused by converting integer-cent arithmetic to float rounding.",
+      "fixture": "corpus/pytest-discount-rounding",
+      "probe": "probe/test_discount.py",
+      "probe_target": ".evalyn/probes/pytest/test_evalyn_benchmark.py",
+      "command": [
+        "python",
+        "-m",
+        "pytest",
+        "-q",
+        "--disable-warnings",
+        "--maxfail=1",
+        "-p",
+        "no:cacheprovider",
+        ".evalyn/probes/pytest/test_evalyn_benchmark.py"
+      ],
+      "availability": ["python", "-m", "pytest", "--version"],
+      "expected": {
+        "base": "pass",
+        "buggy": "fail",
+        "fixed": "pass"
+      },
+      "repetitions": 3
+    },
+    {
+      "id": "vitest-slug-punctuation",
+      "framework": "vitest",
+      "summary": "Detect punctuation leaking into URL slugs after an overly narrow separator rewrite.",
+      "fixture": "corpus/vitest-slug-punctuation",
+      "probe": "probe/slug.test.ts",
+      "probe_target": ".evalyn/probes/vitest/evalyn.benchmark.test.ts",
+      "command": [
+        "npx",
+        "--no-install",
+        "vitest",
+        "run",
+        ".evalyn/probes/vitest/evalyn.benchmark.test.ts",
+        "--reporter=verbose",
+        "--no-cache"
+      ],
+      "availability": ["npx", "--no-install", "vitest", "--version"],
+      "expected": {
+        "base": "pass",
+        "buggy": "fail",
+        "fixed": "pass"
+      },
+      "repetitions": 3
+    }
+  ]
+}
