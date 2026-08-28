@@ -1,0 +1,9 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/ryan7626/Evalyn/security/advisories/new
+    about: Report credential exposure, sandbox escape, destructive Git behavior, or another sensitive vulnerability privately.
+  - name: Security and support policy
+    url: https://github.com/ryan7626/Evalyn/blob/main/SECURITY.md
+    about: Read the alpha security boundaries and supported-version policy.
+

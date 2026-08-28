@@ -1,0 +1,115 @@
+name: Evalyn diff check
+description: Private-alpha preview of containerized differential regression checks
+
+inputs:
+  range:
+    description: Explicit Git comparison in BASE...CANDIDATE form
+    required: true
+  intent:
+    description: Optional preservation invariant or explicit change description
+    required: false
+    default: ""
+  provider:
+    description: anthropic or openai-compatible
+    required: false
+    default: anthropic
+  model:
+    description: Optional provider model override
+    required: false
+    default: ""
+  runtime:
+    description: docker or podman
+    required: false
+    default: docker
+  fail-on:
+    description: likely or never
+    required: false
+    default: likely
+  output:
+    description: SARIF output path, relative to the checked-out repository
+    required: false
+    default: evalyn.sarif
+  state-root:
+    description: External state directory; defaults beneath RUNNER_TEMP
+    required: false
+    default: ""
+  python-version:
+    description: Python version used to install Evalyn
+    required: false
+    default: "3.12"
+
+outputs:
+  sarif:
+    description: Absolute path to the generated SARIF file
+    value: ${{ steps.check.outputs.sarif }}
+  exit-code:
+    description: Evalyn exit code (0 clear, 1 finding, 2 usage, 3 incomplete)
+    value: ${{ steps.check.outputs.exit-code }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python-version }}
+        cache: pip
+
+    - name: Install this Evalyn checkout
+      shell: bash
+      run: python -m pip install "$GITHUB_ACTION_PATH"
+
+    - name: Check Git diff
+      id: check
+      shell: bash
+      env:
+        EVALYN_ACTION_FAIL_ON: ${{ inputs.fail-on }}
+        EVALYN_ACTION_INTENT: ${{ inputs.intent }}
+        EVALYN_ACTION_MODEL: ${{ inputs.model }}
+        EVALYN_ACTION_OUTPUT: ${{ inputs.output }}
+        EVALYN_ACTION_PROVIDER: ${{ inputs.provider }}
+        EVALYN_ACTION_RANGE: ${{ inputs.range }}
+        EVALYN_ACTION_RUNTIME: ${{ inputs.runtime }}
+        EVALYN_ACTION_STATE_ROOT: ${{ inputs.state-root }}
+      run: |
+        if [[ -z "$EVALYN_ACTION_RANGE" ]]; then
+          echo "The range input must be BASE...CANDIDATE." >&2
+          exit 2
+        fi
+
+        output_path="$EVALYN_ACTION_OUTPUT"
+        if [[ "$output_path" != /* ]]; then
+          output_path="$GITHUB_WORKSPACE/$output_path"
+        fi
+        state_root="$EVALYN_ACTION_STATE_ROOT"
+        if [[ -z "$state_root" ]]; then
+          state_root="$RUNNER_TEMP/evalyn-state"
+        elif [[ "$state_root" != /* ]]; then
+          state_root="$RUNNER_TEMP/$state_root"
+        fi
+
+        args=(
+          evalyn
+          --repo "$GITHUB_WORKSPACE"
+          --state-root "$state_root"
+          check "$EVALYN_ACTION_RANGE"
+          --runtime "$EVALYN_ACTION_RUNTIME"
+          --provider "$EVALYN_ACTION_PROVIDER"
+          --fail-on "$EVALYN_ACTION_FAIL_ON"
+          --format sarif
+          --output "$output_path"
+        )
+        if [[ -n "$EVALYN_ACTION_INTENT" ]]; then
+          args+=(--intent "$EVALYN_ACTION_INTENT")
+        fi
+        if [[ -n "$EVALYN_ACTION_MODEL" ]]; then
+          args+=(--model "$EVALYN_ACTION_MODEL")
+        fi
+
+        set +e
+        "${args[@]}"
+        status=$?
+        set -e
+        echo "sarif=$output_path" >> "$GITHUB_OUTPUT"
+        echo "exit-code=$status" >> "$GITHUB_OUTPUT"
+        exit "$status"

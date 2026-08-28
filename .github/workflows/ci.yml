@@ -1,0 +1,142 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: Python ${{ matrix.python }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python: "3.10"
+          - os: ubuntu-latest
+            python: "3.14"
+          - os: macos-latest
+            python: "3.12"
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up project
+        uses: ./.github/actions/setup-python-project
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Compile source
+        run: python -m compileall -q src
+
+      - name: Run unit and integration tests
+        run: >-
+          python -m pytest
+          --cov=evalyn
+          --cov-report=term-missing
+          --cov-report=xml
+          --cov-fail-under=75
+
+      - name: Upload coverage artifact
+        if: matrix.os == 'ubuntu-latest' && matrix.python == '3.14'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml
+          path: coverage.xml
+          if-no-files-found: error
+
+  repository-assets:
+    name: Repository assets and no-key demo
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up project
+        uses: ./.github/actions/setup-python-project
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node for the Vitest benchmark
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install pinned Vitest benchmark tool
+        run: |
+          npm install --prefix "$RUNNER_TEMP/evalyn-vitest-tool" \
+            --ignore-scripts --no-package-lock vitest@2.1.9
+          echo "$RUNNER_TEMP/evalyn-vitest-tool/node_modules/.bin" >> "$GITHUB_PATH"
+
+      - name: Check repository-owned Python
+        run: |
+          python -m ruff check src tests bench examples demo.py
+          python -m ruff format --check src tests bench examples demo.py
+
+      - name: Validate static assets and demo
+        uses: ./.github/actions/validate-assets
+
+      - name: Execute deterministic Vitest corpus case
+        run: >-
+          python -m bench.runner
+          --execute
+          --strict-tools
+          --case vitest-slug-punctuation
+
+  container-smoke:
+    name: Live Docker boundary
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up project
+        uses: ./.github/actions/setup-python-project
+        with:
+          python-version: "3.12"
+
+      - name: Pull smoke image
+        run: docker pull python:3.12-slim
+
+      - name: Run trusted live container smoke
+        env:
+          EVALYN_LIVE_CONTAINER: "1"
+        run: python -m pytest -q tests/test_live_container.py
+
+  package:
+    name: Build package
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up project
+        uses: ./.github/actions/setup-python-project
+        with:
+          python-version: "3.12"
+
+      - name: Build wheel and source distribution
+        run: python -m build
+
+      - name: Upload distributions for inspection
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-distributions
+          path: dist/
+          if-no-files-found: error

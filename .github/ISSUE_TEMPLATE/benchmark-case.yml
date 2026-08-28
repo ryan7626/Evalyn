@@ -1,0 +1,42 @@
+name: Benchmark case
+description: Propose a causal base-pass, buggy-fail, fixed-pass fixture
+title: "bench: "
+labels:
+  - benchmark
+body:
+  - type: input
+    id: framework
+    attributes:
+      label: Framework and version
+      placeholder: pytest 8 or Vitest 2
+    validations:
+      required: true
+
+  - type: textarea
+    id: defect
+    attributes:
+      label: Seeded defect
+      description: Describe the single behavior changed by the buggy snapshot.
+    validations:
+      required: true
+
+  - type: textarea
+    id: oracle
+    attributes:
+      label: Independent oracle
+      description: Explain why the expected behavior is not inferred from the buggy implementation.
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: constraints
+    attributes:
+      label: Corpus constraints
+      options:
+        - label: The base passes, buggy snapshot fails, and fixed snapshot passes the identical probe.
+          required: true
+        - label: The fixture requires no credentials, external services, or nondeterministic timing.
+          required: true
+        - label: The benchmark runner will not download dependencies.
+          required: true
+

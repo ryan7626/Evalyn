@@ -1,0 +1,82 @@
+name: Bug report
+description: Report reproducible incorrect behavior in the private alpha
+title: "bug: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Evalyn 0.2 is private, unreleased, and unsupported for production use.
+        Do not include API keys, proprietary source, or private command output.
+
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      placeholder: 0.2.0a1 or a commit SHA
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - CLI
+        - Git range or dirty overlay
+        - Worktree isolation or cleanup
+        - Container or process execution
+        - pytest adapter
+        - Vitest adapter
+        - Model provider
+        - Classification or triage
+        - Reports or run store
+        - Documentation or benchmark
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Include exact safe commands and a minimal public fixture when possible.
+      placeholder: |
+        1. Create...
+        2. Run...
+        3. Observe...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      placeholder: macOS 15, Python 3.12, Docker 27
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety check
+      options:
+        - label: I removed secrets and proprietary source from this report.
+          required: true
+        - label: This is not a sensitive vulnerability that belongs in private reporting.
+          required: true
+

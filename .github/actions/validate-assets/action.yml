@@ -1,0 +1,22 @@
+name: Validate Evalyn repository assets
+description: Check static repository assets and execute the deterministic no-key demo
+
+runs:
+  using: composite
+  steps:
+    - name: Validate YAML, JSON, Markdown, and corpus metadata
+      shell: bash
+      run: python -m bench.validate_repository
+
+    - name: Execute deterministic pytest corpus case
+      shell: bash
+      run: >-
+        python -m bench.runner
+        --execute
+        --strict-tools
+        --case pytest-discount-rounding
+
+    - name: Run public no-key demo
+      shell: bash
+      run: python demo.py
+

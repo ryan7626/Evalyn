@@ -1,0 +1,50 @@
+name: Feature proposal
+description: Propose a bounded improvement with a measurable user outcome
+title: "feat: "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What concrete workflow is blocked or unreliable today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe observable behavior, not only implementation.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: boundary
+    attributes:
+      label: Primary boundary
+      options:
+        - Core differential engine
+        - Framework adapter
+        - Execution safety
+        - Provider
+        - CLI or report
+        - Benchmark or documentation
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Acceptance evidence
+      description: Which test, fixture, metric, or reproduction would prove this useful?
+    validations:
+      required: true
+
+  - type: textarea
+    id: risks
+    attributes:
+      label: Safety and compatibility risks
+      description: Include effects on Git state, command execution, credentials, and output semantics.
+
