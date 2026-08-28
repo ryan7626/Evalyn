@@ -1,9 +1,19 @@
-from playwright.sync_api import sync_playwright
+"""Convenience entry point for the deterministic no-key demo."""
 
-with sync_playwright() as p:
-    browser = p.chromium.launch(headless=False)
-    page = browser.new_page()
-    page.goto('https://example.com')
-    print("Testing Playwright - Please watch the browser tab!")
-    page.wait_for_timeout(10000)
-    browser.close()
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+
+
+def main() -> int:
+    return subprocess.run(
+        [sys.executable, "examples/no-key-demo/run_demo.py"],
+        cwd=ROOT,
+        check=False,
+    ).returncode
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

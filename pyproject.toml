@@ -1,8 +1,23 @@
 [project]
 name = "evalyn"
-version = "0.1.0"
-description = "Overnight autonomous codebase testing and repair agent"
+dynamic = ["version"]
+description = "Generate disposable tests for a Git diff and surface stable regressions"
+readme = "README.md"
 requires-python = ">=3.10"
+keywords = ["testing", "git", "regression", "developer-tools", "llm"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Testing",
+    "Typing :: Typed",
+]
 dependencies = [
     "click>=8.1",
     "anthropic>=0.40",
@@ -14,9 +29,18 @@ dependencies = [
 [project.scripts]
 evalyn = "evalyn.cli:main"
 
+[project.urls]
+Homepage = "https://github.com/ryan7626/Evalyn"
+Repository = "https://github.com/ryan7626/Evalyn"
+Issues = "https://github.com/ryan7626/Evalyn/issues"
+
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "pytest-cov"]
-browser = ["playwright>=1.40.0"]
+dev = [
+    "build>=1.2",
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "ruff>=0.12",
+]
 
 [build-system]
 requires = ["setuptools>=68.0", "wheel"]
@@ -25,11 +49,33 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+evalyn = ["py.typed"]
+
+[tool.setuptools.dynamic]
+version = {attr = "evalyn.__version__"}
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 # Prevent pytest from treating TestResult (a dataclass in models.py) as a test class
 python_classes = ["Test*"]
 python_files = ["test_*.py"]
+markers = [
+    "live_container: opt-in smoke tests that require a reachable Docker daemon",
+]
 filterwarnings = [
     "ignore::pytest.PytestCollectionWarning",
 ]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.coverage.run]
+source = ["evalyn"]
+
+[tool.coverage.report]
+fail_under = 75

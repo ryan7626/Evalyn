@@ -1,487 +1,625 @@
-"""Evalyn CLI — entry point for plan, run, and status commands."""
+"""Evalyn v0.2 command-line interface."""
 
+from __future__ import annotations
+
+import json
+import logging
 import os
+import re
+import tempfile
+from contextlib import suppress
+from dataclasses import dataclass
 from pathlib import Path
 
 import click
 from dotenv import load_dotenv
 from rich.console import Console
-from rich.panel import Panel
+from rich.markdown import Markdown
 from rich.table import Table
 
 from evalyn import __version__
-from evalyn.config import load_config, ConfigError
-from evalyn.llm.claude_provider import ClaudeProvider, ClaudeProviderError
-from evalyn.llm.openrouter_provider import OpenRouterProvider, OpenRouterProviderError
-from evalyn.planner.planner import run_planning_phase
-from evalyn.runner.runner import run_execution_phase
-from evalyn.state import load_state
-from evalyn.utils.log import get_console_logger
+from evalyn.adapters.registry import default_registry
+from evalyn.execution import RuntimeUnavailableError, resolve_container_engine
+from evalyn.llm import create_provider
+from evalyn.operations import (
+    OperationError,
+    reproduce_saved_finding,
+    triage_saved_finding,
+    validate_finding_id,
+)
+from evalyn.revisions import RevisionError, validate_git_repository
+from evalyn.run_store import RunStore
+from evalyn.settings import SettingsError, load_settings, render_default_config
+from evalyn.workflow import CheckError, CheckOptions, inspect_check, run_check
 
 load_dotenv()
 
-console = Console()
+
+@dataclass(frozen=True)
+class CLIContext:
+    repo: Path
+    config: Path | None
+    state_root: Path | None
+    console: Console
 
 
-def _create_llm(config):
-    """Create the LLM provider based on config, then env-var fallback."""
-    # Explicit config.llm_provider wins; otherwise use env vars to pick.
-    want_openrouter = (
-        config.llm_provider == "openrouter"
-        or (
-            os.environ.get("OPENROUTER_API_KEY")
-            and not os.environ.get("ANTHROPIC_API_KEY")
-        )
-    )
-
-    if want_openrouter:
-        try:
-            model = config.llm_model
-            if "/" not in model:
-                model = "openai/gpt-4o-mini"
-            console.print(f"[dim italic]Using OpenRouter ({model}) for LLM API calls.[/]")
-            return OpenRouterProvider(model=model)
-        except OpenRouterProviderError as e:
-            console.print(f"[bold red]OpenRouter error:[/] {e}")
-            raise SystemExit(1)
-
-    try:
-        return ClaudeProvider(model=config.llm_model)
-    except ClaudeProviderError as e:
-        console.print(f"[bold red]LLM error:[/] {e}")
-        raise SystemExit(1)
-
-
-def validate_repo(repo_path: Path) -> Path:
-    """Validate that the given path is a repo with a CLAUDE.md at root.
-
-    Accepts CLAUDE.md, claude.md, or Claude.md to work on case-sensitive
-    Linux filesystems (e.g. Jetson Nano).
-    """
-    repo = repo_path.resolve()
-    if not repo.is_dir():
-        raise click.BadParameter(f"Directory does not exist: {repo}")
-    for name in ("CLAUDE.md", "claude.md", "Claude.md"):
-        if (repo / name).is_file():
-            return repo
-    raise click.BadParameter(
-        f"No CLAUDE.md found at repo root: {repo}\n"
-        "Evalyn requires a CLAUDE.md context file in the target repository."
-    )
-
-
-@click.group()
+@click.group(context_settings={"help_option_names": ["-h", "--help"]})
+@click.option(
+    "--repo", type=click.Path(path_type=Path, file_okay=False), default=".", show_default=True
+)
+@click.option("--config", type=click.Path(path_type=Path, dir_okay=False))
+@click.option(
+    "--state-root",
+    type=click.Path(path_type=Path, file_okay=False),
+    envvar="EVALYN_STATE_HOME",
+    help="External Evalyn state/artifact root.",
+)
+@click.option("--no-color", is_flag=True)
+@click.option("-v", "--verbose", count=True)
 @click.version_option(version=__version__, prog_name="evalyn")
-def main():
-    """Evalyn — Overnight autonomous codebase testing and repair agent."""
-    pass
-
-
-@main.command()
-@click.option(
-    "--repo",
-    type=click.Path(exists=True, file_okay=False, path_type=Path),
-    default=".",
-    help="Path to the target repository (default: current directory).",
-)
 @click.pass_context
-def plan(ctx, repo: Path):
-    """Analyze changes and generate a test plan for approval."""
-    repo = validate_repo(repo)
-    logger = get_console_logger("plan")
+def main(
+    ctx: click.Context,
+    repo: Path,
+    config: Path | None,
+    state_root: Path | None,
+    no_color: bool,
+    verbose: int,
+) -> None:
+    """Generate disposable tests for a Git diff and surface stable regressions."""
+    logging.basicConfig(level=logging.DEBUG if verbose else logging.WARNING)
+    ctx.obj = CLIContext(
+        repo=repo.expanduser(),
+        config=config.expanduser() if config else None,
+        state_root=state_root.expanduser() if state_root else None,
+        console=Console(color_system=None if no_color else "auto"),
+    )
 
+
+@main.command()
+@click.option("--force", is_flag=True)
+@click.option("--non-interactive", is_flag=True)
+@click.pass_obj
+def init(context: CLIContext, force: bool, non_interactive: bool) -> None:
+    """Detect supported test frameworks and create .evalyn.yml."""
+    del non_interactive
     try:
-        config = load_config(repo)
-    except ConfigError as e:
-        console.print(f"[bold red]Config error:[/] {e}")
-        raise SystemExit(1)
-
-    state = load_state(repo)
-    logger.info(f"Target repo: {repo}")
-    logger.info(f"Last run commit: {state.last_run_commit or 'none (first run)'}")
-
-    llm = _create_llm(config)
-
-    plan_path = run_planning_phase(config, state, llm)
-
-    if plan_path is None:
-        console.print(
-            "\n[bold green]No changes detected since last run.[/] "
-            "Nothing to plan."
-        )
-    else:
-        console.print(f"\n[bold green]Plan generated:[/] {plan_path}")
-        
-        while True:
-            choice = click.prompt(
-                "\n[bold cyan]What would you like to do?[/]\n"
-                "  [y] Approve and execute plan now\n"
-                "  [e] Edit plan.md in my default editor first\n"
-                "  [n] Exit and run later\n"
-                "Your choice",
-                type=click.Choice(['y', 'e', 'n'], case_sensitive=False),
-                default='y',
-                show_choices=False
-            ).lower()
-
-            if choice == 'e':
-                click.edit(filename=str(plan_path))
-                continue
-            
-            elif choice == 'y':
-                content = plan_path.read_text(encoding="utf-8")
-                if "Status: PENDING" in content:
-                    plan_path.write_text(
-                        content.replace("Status: PENDING", "Status: APPROVED"),
-                        encoding="utf-8"
-                    )
-                console.print("\n[bold green]Plan approved. Passing to execution...[/]\n")
-                ctx.invoke(run, repo=repo, categories=(), dry_run=False)
-                break
-                
-            elif choice == 'n':
-                console.print("\n[dim]Run this plan later with:[/]")
-                console.print(f"  [bold cyan]evalyn run --repo {repo}[/]")
-                break
+        repo = validate_git_repository(context.repo)
+    except RevisionError as exc:
+        _usage_error(context, str(exc))
+    path = repo / ".evalyn.yml"
+    if path.exists() and not force:
+        raise click.ClickException(f"{path} already exists; use --force to replace it")
+    adapters = [adapter.name for adapter in default_registry().detect(repo)]
+    try:
+        RunStore.write_text(path, render_default_config(adapters), mode=0o644)
+    except (OSError, ValueError) as exc:
+        raise click.ClickException(f"Could not write {path}: {exc}") from exc
+    context.console.print(f"[green]Created[/] {path}")
+    if not adapters:
+        context.console.print("[yellow]No pytest or Vitest project detected.[/]")
 
 
 @main.command()
 @click.option(
-    "--repo",
-    type=click.Path(exists=True, file_okay=False, path_type=Path),
-    default=".",
-    help="Path to the target repository (default: current directory).",
+    "--format", "output_format", type=click.Choice(["console", "json"]), default="console"
 )
+@click.option("--check-provider", is_flag=True)
+@click.pass_obj
+def doctor(context: CLIContext, output_format: str, check_provider: bool) -> None:
+    """Validate Git, configuration, adapters, runtime, and provider settings."""
+    checks: list[dict[str, str]] = []
+    failed = False
+    try:
+        repo = validate_git_repository(context.repo)
+        checks.append({"name": "git", "status": "ok", "detail": str(repo)})
+        settings = load_settings(repo, context.config)
+        checks.append({"name": "config", "status": "ok", "detail": "schema v1"})
+        adapters = default_registry().detect(repo)
+        failed = failed or not adapters
+        checks.append(
+            {
+                "name": "adapters",
+                "status": "ok" if adapters else "error",
+                "detail": ", ".join(adapter.name for adapter in adapters) or "none detected",
+            }
+        )
+        preferred = None if settings.sandbox.runtime == "auto" else settings.sandbox.runtime
+        engine = resolve_container_engine(preferred)
+        checks.append({"name": "container", "status": "ok", "detail": engine})
+        provider_detail = f"{settings.provider.kind}/{settings.provider.model}"
+        if check_provider:
+            reply = create_provider(settings.provider).complete(
+                "This is a connectivity check. Reply with OK.", "OK", max_tokens=8
+            )
+            provider_detail += f" — replied {reply.strip()[:20]!r}"
+        else:
+            provider_detail += " — connectivity not requested"
+        checks.append({"name": "provider", "status": "ok", "detail": provider_detail})
+    except Exception as exc:
+        failed = True
+        checks.append(
+            {"name": "doctor", "status": "error", "detail": f"{type(exc).__name__}: {exc}"}
+        )
+    if output_format == "json":
+        click.echo(json.dumps({"checks": checks, "ok": not failed}, indent=2))
+    else:
+        table = Table(title="Evalyn doctor")
+        table.add_column("Check")
+        table.add_column("Status")
+        table.add_column("Detail")
+        for item in checks:
+            style = "green" if item["status"] == "ok" else "red"
+            table.add_row(item["name"], f"[{style}]{item['status']}[/]", item["detail"])
+        context.console.print(table)
+    if failed:
+        raise SystemExit(3)
+
+
+@main.command()
+@click.argument("range_spec", required=False)
+@click.option("--include-dirty", is_flag=True)
+@click.option("--intent", multiple=True)
 @click.option(
-    "--category",
-    "categories",
+    "--intent-file",
     multiple=True,
-    help="Run only the named category (repeatable). Overrides plan directives.",
+    type=click.Path(path_type=Path, dir_okay=False, exists=True),
+)
+@click.option("--adapter", "adapters", multiple=True, type=click.Choice(["pytest", "vitest"]))
+@click.option("--include", "include_globs", multiple=True)
+@click.option("--exclude", "exclude_globs", multiple=True)
+@click.option("--max-tests", type=click.IntRange(1, 50))
+@click.option("--repeat", type=click.IntRange(2, 10))
+@click.option("--budget", callback=lambda c, p, v: _parse_duration(v))
+@click.option("--runtime", type=click.Choice(["auto", "docker", "podman"]))
+@click.option("--provider", "provider_kind", type=click.Choice(["anthropic", "openai-compatible"]))
+@click.option("--model")
+@click.option(
+    "--fail-on", type=click.Choice(["likely", "never"]), default="likely", show_default=True
 )
 @click.option(
-    "--dry-run",
-    is_flag=True,
-    default=False,
-    help="Parse the plan and show what would run without executing.",
+    "--format",
+    "output_format",
+    type=click.Choice(["console", "json", "markdown", "sarif"]),
+    default="console",
+    show_default=True,
 )
-def run(repo: Path, categories: tuple[str, ...], dry_run: bool):
-    """Execute the approved test plan."""
-    repo = validate_repo(repo)
-    logger = get_console_logger("run")
-
-    try:
-        config = load_config(repo)
-    except ConfigError as e:
-        console.print(f"[bold red]Config error:[/] {e}")
-        raise SystemExit(1)
-
-    state = load_state(repo)
-    logger.info(f"Target repo: {repo}")
-
-    llm = _create_llm(config)
-
-    category_filter = list(categories) if categories else None
-    result = run_execution_phase(
-        config, state, llm,
-        category_filter=category_filter,
-        dry_run=dry_run,
+@click.option("--output", type=click.Path(path_type=Path, dir_okay=False))
+@click.option("--dry-run", is_flag=True)
+@click.pass_obj
+def check(
+    context: CLIContext,
+    range_spec: str | None,
+    include_dirty: bool,
+    intent: tuple[str, ...],
+    intent_file: tuple[Path, ...],
+    adapters: tuple[str, ...],
+    include_globs: tuple[str, ...],
+    exclude_globs: tuple[str, ...],
+    max_tests: int | None,
+    repeat: int | None,
+    budget: int | None,
+    runtime: str | None,
+    provider_kind: str | None,
+    model: str | None,
+    fail_on: str,
+    output_format: str,
+    output: Path | None,
+    dry_run: bool,
+) -> None:
+    """Check a Git range for stable, evidence-backed behavior regressions."""
+    if output is not None:
+        try:
+            output = _resolve_output_destination(context.repo, output)
+        except (OSError, ValueError) as exc:
+            _usage_error(context, str(exc))
+    intent_values = list(intent)
+    for path in intent_file:
+        try:
+            text = RunStore.read_bytes(path, max_bytes=100_000).decode("utf-8")
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
+            raise click.BadParameter(f"Could not read bounded intent file {path}: {exc}") from exc
+        intent_values.append(text)
+    options = CheckOptions(
+        repo_path=context.repo,
+        range_spec=range_spec,
+        include_dirty=include_dirty,
+        intent=tuple(intent_values),
+        adapters=adapters,
+        include_globs=include_globs,
+        exclude_globs=exclude_globs,
+        max_tests=max_tests,
+        repeat=repeat,
+        budget_seconds=budget,
+        runtime=runtime,
+        provider_kind=provider_kind,
+        model=model,
+        config_path=context.config,
+        state_root=context.state_root,
     )
-
-    if result is None:
-        if dry_run:
-            # dry_run should return a RunResult — if we get None, plan had no categories
-            console.print("\n[bold yellow]Dry run complete.[/] No executable categories found.")
-            return
-        console.print(
-            "\n[bold red]Run could not start.[/] "
-            "Check the errors above."
-        )
-        raise SystemExit(1)
-
     if dry_run:
-        from rich.table import Table as RichTable
-        preview = RichTable(title="Categories That Would Execute", show_header=True)
-        preview.add_column("Category", style="bold")
-        preview.add_column("Priority", style="cyan")
-        preview.add_column("Note")
-        for cat in result.category_results:
-            note = cat.error_message or ""
-            priority = "SKIP" if "not in" in note or "exceeded" in note else note.replace("Dry run — would execute [", "").rstrip("]")
-            preview.add_row(cat.name, priority, "(skipped)" if "skip" in note.lower() or "not in" in note else "✓ would run")
-        console.print("\n")
-        console.print(preview)
-        console.print("\n[bold green]Dry run complete.[/] No tests were executed.")
+        try:
+            inspection = inspect_check(options)
+        except (CheckError, RevisionError, SettingsError, ValueError) as exc:
+            _usage_error(context, str(exc))
+        payload = {
+            "base": inspection.revisions.base_sha,
+            "candidate": inspection.revisions.candidate_sha,
+            "dirty": inspection.dirty,
+            "adapters": list(inspection.adapters),
+            "changed_files": list(inspection.changed_files),
+        }
+        if output_format == "json":
+            click.echo(json.dumps(payload, indent=2))
+        else:
+            context.console.print("[bold]Evalyn dry run[/]")
+            context.console.print(f"Base:      {payload['base']}")
+            context.console.print(f"Candidate: {payload['candidate']}")
+            context.console.print(f"Adapters:  {', '.join(payload['adapters'])}")
+            context.console.print(f"Files:     {len(payload['changed_files'])}")
         return
-
-    # Print summary
-    summary_text = (
-        f"  ✅ Passed:    {result.passed_count}\n"
-        f"  ❌ Failed:    {result.failed_count}\n"
-        f"  ❓ Uncertain: {result.uncertain_count}\n"
-        f"  ⏭️  Skipped:   {result.skipped_count}\n"
-        f"  ⏱️  Duration:  {result.total_duration_seconds:.1f}s\n\n"
-        f"  Branch: [bold cyan]{result.branch}[/]\n"
-        f"  Report: [bold]{result.run_dir / 'report.md'}[/]"
-    )
-    console.print(Panel(summary_text, title=f"Run Complete — {result.run_dir}", border_style="green"))
+    try:
+        outcome = run_check(options)
+    except CheckError as exc:
+        suffix = f"\nArtifacts: {exc.run_path}" if exc.run_path else ""
+        context.console.print(f"[red]Incomplete:[/] {exc}{suffix}")
+        raise SystemExit(3) from None
+    except (RevisionError, SettingsError, ValueError) as exc:
+        _usage_error(context, str(exc))
+    except Exception as exc:
+        context.console.print(f"[red]Incomplete:[/] {type(exc).__name__}: {exc}")
+        raise SystemExit(3) from None
+    try:
+        _emit_check_output(context, outcome, output_format, output)
+    except Exception as exc:
+        context.console.print(
+            f"[red]Incomplete:[/] Could not emit check output: {type(exc).__name__}: {exc}"
+        )
+        raise SystemExit(3) from None
+    if outcome.incomplete:
+        raise SystemExit(3)
+    if fail_on == "likely" and outcome.gating_findings:
+        raise SystemExit(1)
 
 
 @main.command()
+@click.argument("identifier", required=False)
 @click.option(
-    "--repo",
-    type=click.Path(exists=True, file_okay=False, path_type=Path),
-    default=".",
-    help="Path to the target repository (default: current directory).",
+    "--format",
+    "output_format",
+    type=click.Choice(["console", "json", "markdown", "sarif"]),
+    default="console",
 )
-def status(repo: Path):
-    """Show current agent state and latest run info."""
-    repo = validate_repo(repo)
+@click.pass_obj
+def show(context: CLIContext, identifier: str | None, output_format: str) -> None:
+    """Show the latest run, a run ID, or a finding ID."""
+    try:
+        repo = validate_git_repository(context.repo)
+        store = RunStore(repo, context.state_root)
+    except (RevisionError, ValueError) as exc:
+        _usage_error(context, str(exc))
+    if identifier and identifier.upper().startswith("EVL-"):
+        try:
+            identifier = validate_finding_id(identifier)
+        except OperationError as exc:
+            _usage_error(context, str(exc))
+        located = store.find_finding(identifier)
+        if located is None:
+            raise click.ClickException(f"Finding not found: {identifier}")
+        _emit_value(context, located[1], output_format)
+        return
+    run = store.get(identifier)
+    if run is None:
+        raise click.ClickException("No matching Evalyn run found")
+    path = run.path / {"json": "findings.json", "sarif": "evalyn.sarif"}.get(
+        output_format, "report.md"
+    )
+    if not path.is_file():
+        context.console.print(f"[red]Incomplete:[/] Run output is missing: {path}")
+        raise SystemExit(3)
+    try:
+        text = RunStore.read_bytes(path, max_bytes=32 * 1024 * 1024).decode("utf-8")
+        context.console.print(Markdown(text)) if output_format == "console" else click.echo(text)
+    except Exception as exc:
+        context.console.print(
+            f"[red]Incomplete:[/] Could not read run output: {type(exc).__name__}: {exc}"
+        )
+        raise SystemExit(3) from None
+
+
+@main.command()
+@click.argument("finding_id")
+@click.option("--side", type=click.Choice(["base", "candidate", "both"]), default="both")
+@click.option(
+    "--repeat",
+    type=click.IntRange(1, 10),
+    help="Override the saved run's repetition count.",
+)
+@click.option("--runtime", type=click.Choice(["docker", "podman"]))
+@click.pass_obj
+def reproduce(
+    context: CLIContext,
+    finding_id: str,
+    side: str,
+    repeat: int | None,
+    runtime: str | None,
+) -> None:
+    """Re-run the exact stored probe against its pinned revisions."""
+    try:
+        finding_id = validate_finding_id(finding_id)
+    except OperationError as exc:
+        _usage_error(context, str(exc))
+    try:
+        repo = validate_git_repository(context.repo)
+        result = reproduce_saved_finding(
+            RunStore(repo, context.state_root),
+            finding_id,
+            side=side,
+            repeat=repeat,
+            runtime=runtime,
+        )
+    except (RevisionError, OperationError, RuntimeUnavailableError, ValueError) as exc:
+        context.console.print(f"[red]Incomplete:[/] {exc}")
+        raise SystemExit(3) from None
+    context.console.print(f"[bold]{finding_id}[/]")
+    if result.base:
+        context.console.print("Base:      " + ", ".join(item.status.value for item in result.base))
+    if result.candidate:
+        context.console.print(
+            "Candidate: " + ", ".join(item.status.value for item in result.candidate)
+        )
+
+
+@main.command()
+@click.argument("finding_id")
+@click.option("--confirm", is_flag=True)
+@click.option("--dismiss", is_flag=True)
+@click.option("--uncertain", is_flag=True)
+@click.option("--reason", required=True)
+@click.pass_obj
+def triage(
+    context: CLIContext,
+    finding_id: str,
+    confirm: bool,
+    dismiss: bool,
+    uncertain: bool,
+    reason: str,
+) -> None:
+    """Record a human disposition for a finding."""
+    try:
+        finding_id = validate_finding_id(finding_id)
+    except OperationError as exc:
+        _usage_error(context, str(exc))
+    selections = [
+        name
+        for name, enabled in (
+            ("confirmed", confirm),
+            ("dismissed", dismiss),
+            ("uncertain", uncertain),
+        )
+        if enabled
+    ]
+    if len(selections) != 1:
+        raise click.UsageError("Choose exactly one of --confirm, --dismiss, or --uncertain")
+    try:
+        repo = validate_git_repository(context.repo)
+        run, _finding = triage_saved_finding(
+            RunStore(repo, context.state_root), finding_id, status=selections[0], reason=reason
+        )
+    except (RevisionError, OperationError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    context.console.print(f"[green]Updated[/] {finding_id} in {run.path}")
+
+
+@main.command()
+@click.argument("finding_id")
+@click.option("--emit-patch", type=click.Path(path_type=Path, dir_okay=False), required=True)
+@click.option("--runtime", type=click.Choice(["docker", "podman"]))
+@click.pass_obj
+def repair(context: CLIContext, finding_id: str, emit_patch: Path, runtime: str | None) -> None:
+    """EXPERIMENTAL: validate a model repair and emit a patch without applying it."""
+    from evalyn.repair_v2 import RepairError, repair_saved_finding
 
     try:
-        config = load_config(repo)
-    except ConfigError as e:
-        console.print(f"[bold red]Config error:[/] {e}")
-        raise SystemExit(1)
+        finding_id = validate_finding_id(finding_id)
+    except OperationError as exc:
+        _usage_error(context, str(exc))
+    try:
+        repo = validate_git_repository(context.repo)
+        result = repair_saved_finding(
+            RunStore(repo, context.state_root),
+            finding_id,
+            output_path=emit_patch,
+            runtime=runtime,
+            config_path=context.config,
+        )
+    except (RevisionError, RepairError, ValueError) as exc:
+        context.console.print(f"[red]Repair not emitted:[/] {exc}")
+        raise SystemExit(3) from None
+    context.console.print(f"[green]Verified experimental patch:[/] {result}")
 
-    state = load_state(repo)
 
-    table = Table(title="Evalyn Agent Status", show_header=False, box=None)
-    table.add_row("Repository:", str(repo))
-
-    # Humanize the raw timestamp string
-    ts_raw = state.last_run_timestamp
-    ts_display = "never"
-    if ts_raw:
-        try:
-            from datetime import datetime
-            dt = datetime.strptime(ts_raw, "%Y-%m-%d_%H%M%S")
-            ts_display = dt.strftime("%B %d, %Y at %I:%M %p UTC")
-        except ValueError:
-            ts_display = ts_raw
-    table.add_row("Last run:", ts_display)
-
-    table.add_row("Last commit:", str(state.last_run_commit or 'n/a'))
-
-    status_str = state.last_run_status or 'n/a'
-    if status_str in ('completed', 'passed'):
-        status_str = f"[green]{status_str}[/]"
-    elif status_str == 'completed_with_issues':
-        status_str = f"[yellow]{status_str}[/]"
-    elif status_str in ('failed', 'aborted'):
-        status_str = f"[red]{status_str}[/]"
-    elif status_str == 'in_progress':
-        status_str = f"[cyan]{status_str}[/]"
-    elif status_str == 'recovered':
-        status_str = f"[dim]{status_str}[/]"
-    table.add_row("Last status:", status_str)
-
-    table.add_row("Agent branch:", str(state.current_branch or 'n/a'))
-    table.add_row("Total runs:", str(len(state.run_history)))
-
-    console.print("\n")
-    console.print(table)
-    console.print("\n")
+@main.command(name="runs")
+@click.option("--limit", type=click.IntRange(1, 1000), default=20, show_default=True)
+@click.option(
+    "--format", "output_format", type=click.Choice(["console", "json"]), default="console"
+)
+@click.pass_obj
+def list_runs(context: CLIContext, limit: int, output_format: str) -> None:
+    """List stored runs for this repository."""
+    try:
+        repo = validate_git_repository(context.repo)
+        runs = RunStore(repo, context.state_root).list_runs(limit)
+    except (RevisionError, ValueError) as exc:
+        _usage_error(context, str(exc))
+    if output_format == "json":
+        click.echo(json.dumps([run.manifest for run in runs], indent=2))
+        return
+    table = Table(title="Evalyn runs")
+    for heading in ("Run", "Status", "Base", "Candidate", "Findings"):
+        table.add_column(heading)
+    for run in runs:
+        table.add_row(
+            run.run_id,
+            str(run.manifest.get("status", "unknown")),
+            str(run.manifest.get("base", ""))[:12],
+            str(run.manifest.get("candidate_id", run.manifest.get("candidate", "")))[:20],
+            str(run.manifest.get("finding_count", 0)),
+        )
+    context.console.print(table)
 
 
 @main.command()
-@click.option(
-    "--repo",
-    type=click.Path(exists=True, file_okay=False, path_type=Path),
-    default=".",
-    help="Path to the target repository (default: current directory).",
-)
-@click.option(
-    "--all",
-    "clean_all",
-    is_flag=True,
-    default=False,
-    help="Remove all evalyn/* branches and reset agent state.",
-)
-@click.option(
-    "--force",
-    is_flag=True,
-    default=False,
-    help="Skip confirmation prompt.",
-)
-def clean(repo: Path, clean_all: bool, force: bool):
-    """Clean up stale evalyn branches and reset agent state."""
-    repo = validate_repo(repo)
-
-    from evalyn.utils.git import (
-        list_branches,
-        get_current_branch,
-        checkout_branch,
-        delete_branch,
-        reset_hard,
-    )
-    from evalyn.state import reset_state
-
-    branches = list_branches(repo, "evalyn/*")
-    state = load_state(repo)
-
-    if not branches and state.last_run_status not in ("in_progress", "aborted"):
-        console.print("\n[bold green]Nothing to clean.[/] No stale branches found.")
-        return
-
-    # Show what we found
-    console.print("\n[bold]Evalyn Cleanup[/]")
-    console.print(f"  Repository: {repo}")
-    if branches:
-        console.print(f"  Stale branches ({len(branches)}):")
-        for b in branches:
-            console.print(f"    • {b}")
-    if state.last_run_status in ("in_progress", "aborted"):
-        console.print(f"  State: [yellow]{state.last_run_status}[/] (will be reset)")
-
-    if not clean_all:
-        console.print("\n[dim]Use --all to remove all branches and reset state.[/]")
-        return
-
-    # Confirm
-    if not force:
-        click.confirm("\nProceed with cleanup?", abort=True)
-
-    # Clean branches
-    current = get_current_branch(repo)
-    deleted = 0
-    for b in branches:
-        try:
-            if current == b:
-                reset_hard(repo)
-                # Try main, then master, then give up
-                checked_out = False
-                for default_branch in ("main", "master"):
-                    try:
-                        checkout_branch(repo, default_branch)
-                        current = default_branch
-                        checked_out = True
-                        break
-                    except Exception:
-                        continue
-                if not checked_out:
-                    console.print(f"  [yellow]⚠[/] Could not determine default branch — skipping deletion of {b}")
-                    continue
-            delete_branch(repo, b, force=True)
-            deleted += 1
-            console.print(f"  [red]✗[/] Deleted branch: {b}")
-        except Exception as e:
-            console.print(f"  [yellow]⚠[/] Could not delete {b}: {e}")
-
-    # Reset state
-    reset_state(repo)
-    console.print(f"\n[bold green]Cleanup complete.[/] Deleted {deleted} branch(es), state reset.")
-
-
-# ---------------------------------------------------------------------------
-# Templates for `evalyn init`
-# ---------------------------------------------------------------------------
-
-_CLAUDE_MD_TEMPLATE = """\
-# Project Context
-
-> Fill this in — Evalyn reads this file as the source of truth for your repo.
-
-## Overview
-
-<!-- Brief description of the project and its purpose -->
-
-## Stack
-
-<!-- e.g. Next.js, TypeScript, Python, Postgres -->
-
-## Test Commands
-
-<!-- How to run your existing tests. Examples:
-- Unit tests: `pytest tests/`
-- Frontend:   `npm test`
-- Type check: `npx tsc --noEmit`
--->
-
-## Services
-
-<!-- Services that must be running for integration tests. Example:
-services:
-  - name: backend
-    command: npm run dev
-    port: 3000
-    health_check_url: http://localhost:3000/health
--->
-"""
-
-_CONFIG_YAML_TEMPLATE = """\
-# Evalyn per-repo configuration (all settings optional)
-
-# LLM settings
-# llm:
-#   provider: claude           # claude | openrouter
-#   model: claude-3-5-sonnet-20241022
-
-# Execution settings
-# execution:
-#   max_fix_retries: 3         # fix hypotheses tried per failing test
-#   test_timeout_seconds: 300  # per-command timeout
-#   max_output_lines: 200      # max output lines sent to LLM
-
-# Services to start before testing
-# services:
-#   - name: backend
-#     command: npm run dev
-#     port: 3000
-#     health_check_url: http://localhost:3000/health
-"""
+@click.option("--runs-before", type=click.IntRange(0, 100_000), default=30, show_default=True)
+@click.pass_obj
+def clean(context: CLIContext, runs_before: int) -> None:
+    """Remove old external artifacts; never reset or clean a Git checkout."""
+    try:
+        repo = validate_git_repository(context.repo)
+        removed = RunStore(repo, context.state_root).clean_before(runs_before)
+    except (RevisionError, ValueError) as exc:
+        _usage_error(context, str(exc))
+    noun = "directory" if removed == 1 else "directories"
+    context.console.print(f"Removed {removed} owned run artifact {noun}.")
 
 
 @main.command()
-@click.option(
-    "--repo",
-    type=click.Path(file_okay=False, path_type=Path),
-    default=".",
-    help="Path to the target repository to initialize (default: current directory).",
-)
-def init(repo: Path):
-    """Scaffold a target repository for use with Evalyn.
+@click.pass_obj
+def demo(context: CLIContext) -> None:
+    """Run the bundled no-key regression demonstration."""
+    from evalyn.demo import DemoError, run_demo
 
-    Creates CLAUDE.md and .agent/config.yaml if they don't exist.
-    """
-    repo = repo.resolve()
+    try:
+        result = run_demo(state_root=context.state_root)
+        report = RunStore.read_bytes(result.report_path, max_bytes=32 * 1024 * 1024).decode("utf-8")
+    except (DemoError, OSError, UnicodeDecodeError, ValueError) as exc:
+        context.console.print(f"[red]Demo incomplete:[/] {exc}")
+        raise SystemExit(3) from None
+    context.console.print(Markdown(report))
+    context.console.print(f"\nArtifacts: {result.run_path}")
+
+
+def _emit_check_output(
+    context: CLIContext, outcome, output_format: str, output: Path | None
+) -> None:
+    key = {"console": "markdown", "markdown": "markdown", "json": "json", "sarif": "sarif"}[
+        output_format
+    ]
+    path = _validated_report_path(outcome, key)
+    payload = RunStore.read_bytes(path, max_bytes=32 * 1024 * 1024)
+    if output is not None:
+        destination = _resolve_output_destination(context.repo, output)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination = _resolve_output_destination(context.repo, destination)
+        _copy_file_atomically(payload, destination)
+    text = payload.decode("utf-8")
+    if output_format == "console":
+        context.console.print(Markdown(text))
+        context.console.print(f"Artifacts: {outcome.run.path}")
+    else:
+        click.echo(text)
+
+
+def _validated_report_path(outcome, key: str) -> Path:
+    """Return an owned regular report file from the completed run."""
+    path = Path(outcome.report_paths[key])
+    if path.is_symlink():
+        raise OSError(f"Run report cannot be a symlink: {path}")
+    run_root = Path(outcome.run.path).resolve(strict=True)
+    resolved = path.resolve(strict=True)
+    try:
+        resolved.relative_to(run_root)
+    except ValueError as exc:
+        raise OSError(f"Run report escaped its artifact directory: {path}") from exc
+    if not resolved.is_file():
+        raise OSError(f"Run report is not a regular file: {path}")
+    return resolved
+
+
+def _resolve_output_destination(repo_path: Path, output: Path) -> Path:
+    """Resolve output inside the repo; absolute paths outside it are rejected."""
+    repo = repo_path.expanduser().resolve(strict=True)
     if not repo.is_dir():
-        console.print(f"[bold red]Error:[/] Directory does not exist: {repo}")
-        raise SystemExit(1)
+        raise ValueError(f"Target repository is not a directory: {repo}")
+    requested = output.expanduser()
+    candidate = requested if requested.is_absolute() else repo / requested
+    candidate = Path(os.path.abspath(candidate))
+    _reject_symlink_components(candidate)
+    destination = candidate.resolve(strict=False)
+    try:
+        relative = destination.relative_to(repo)
+    except ValueError as exc:
+        kind = "absolute" if requested.is_absolute() else "relative"
+        raise ValueError(f"{kind} output must resolve inside the target repository") from exc
+    if not relative.parts or relative.parts[0].casefold() == ".git":
+        raise ValueError("output cannot target the repository root or Git metadata")
+    if destination.exists() and not destination.is_file():
+        raise ValueError("output destination must name a regular file")
+    if destination.parent.exists() and not destination.parent.is_dir():
+        raise ValueError("output parent must be a directory")
+    return destination
 
-    created: list[str] = []
 
-    # --- CLAUDE.md ---
-    existing_md = next(
-        (repo / n for n in ("CLAUDE.md", "claude.md", "Claude.md") if (repo / n).is_file()),
-        None,
+def _reject_symlink_components(path: Path) -> None:
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current /= part
+        if current.is_symlink():
+            raise ValueError(f"output path cannot contain symlinks: {current}")
+
+
+def _copy_file_atomically(payload: bytes, destination: Path) -> None:
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.", dir=destination.parent
     )
-    if existing_md:
-        console.print(f"[dim]✓ {existing_md.name} already exists — skipping.[/]")
-    else:
-        target = repo / "CLAUDE.md"
-        target.write_text(_CLAUDE_MD_TEMPLATE, encoding="utf-8")
-        created.append("CLAUDE.md")
-        console.print(f"[bold green]✓[/] Created [bold]CLAUDE.md[/]")
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as writer:
+            writer.write(payload)
+            writer.flush()
+            os.fsync(writer.fileno())
+        temporary.replace(destination)
+    except BaseException:
+        with suppress(OSError):
+            os.close(descriptor)
+        temporary.unlink(missing_ok=True)
+        raise
 
-    # --- .agent/config.yaml ---
-    agent_dir = repo / ".agent"
-    agent_dir.mkdir(exist_ok=True)
-    config_yaml = agent_dir / "config.yaml"
-    if config_yaml.is_file():
-        console.print("[dim]✓ .agent/config.yaml already exists — skipping.[/]")
-    else:
-        config_yaml.write_text(_CONFIG_YAML_TEMPLATE, encoding="utf-8")
-        created.append(".agent/config.yaml")
-        console.print("[bold green]✓[/] Created [bold].agent/config.yaml[/]")
 
-    if created:
-        console.print(
-            f"\n[bold green]Repository initialized![/] "
-            f"Edit [bold]CLAUDE.md[/] to describe your project, then run:\n"
-            f"  [bold cyan]evalyn plan --repo {repo}[/]"
+def _emit_value(context: CLIContext, value: dict, output_format: str) -> None:
+    if output_format in {"json", "sarif"}:
+        click.echo(json.dumps(value, indent=2))
+        return
+    rendered = "\n".join(
+        (
+            f"# {value.get('finding_id', 'Finding')}",
+            "",
+            str(value.get("title", "")),
+            "",
+            f"- Semantic state: `{value.get('semantic_state', 'unknown')}`",
+            f"- Triage: `{value.get('triage_status', 'unreviewed')}`",
+            f"- Oracle: {value.get('oracle', '')}",
+            f"- Reproduce: `evalyn reproduce {value.get('finding_id', '')}`",
         )
-    else:
-        console.print(
-            "\n[dim]Nothing to do — repository is already initialized.[/]\n"
-            f"Run [bold cyan]evalyn plan --repo {repo}[/] to generate a test plan."
-        )
+    )
+    context.console.print(Markdown(rendered)) if output_format == "console" else click.echo(
+        rendered
+    )
+
+
+def _usage_error(context: CLIContext, message: str) -> None:
+    context.console.print(f"[red]Error:[/] {message}")
+    raise SystemExit(2)
+
+
+def _parse_duration(value: str | None) -> int | None:
+    if value is None:
+        return None
+    match = re.fullmatch(r"([1-9][0-9]*)([smh]?)", value.strip().casefold())
+    if not match:
+        raise click.BadParameter("duration must look like 90s, 10m, or 1h")
+    return int(match.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600}[match.group(2)]
+
+
+if __name__ == "__main__":
+    main()
