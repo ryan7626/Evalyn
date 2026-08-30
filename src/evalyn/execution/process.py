@@ -51,6 +51,7 @@ _PROTECTED_ENV_NAMES = frozenset(
         "GIT_ASKPASS",
         "GIT_CONFIG_GLOBAL",
         "GIT_CONFIG_NOSYSTEM",
+        "GIT_NO_REPLACE_OBJECTS",
         "GOOGLE_APPLICATION_CREDENTIALS",
         "HOME",
         "KUBECONFIG",
@@ -398,6 +399,7 @@ class CommandRunner:
             {
                 "GIT_CONFIG_GLOBAL": os.devnull,
                 "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_NO_REPLACE_OBJECTS": "1",
                 "GIT_TERMINAL_PROMPT": "0",
                 "HOME": home,
                 "LOGNAME": "evalyn",

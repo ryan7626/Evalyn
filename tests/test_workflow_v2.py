@@ -1,3 +1,4 @@
+import re
 import subprocess
 from pathlib import Path
 
@@ -7,7 +8,8 @@ import evalyn.workflow as workflow_module
 from evalyn.engine.models import ExecutionResult, ExecutionStatus
 from evalyn.execution.worktree import WorktreeSession
 from evalyn.llm.base import BaseLLM
-from evalyn.settings import load_settings
+from evalyn.run_store import RunStore
+from evalyn.settings import SettingsError, load_settings
 from evalyn.workflow import (
     CheckError,
     CheckOptions,
@@ -43,6 +45,11 @@ def repo(tmp_path: Path) -> Path:
         encoding="utf-8",
     )
     (target / "value.py").write_text("def value(): return 1\n", encoding="utf-8")
+    (target / "tests").mkdir()
+    (target / "tests" / "test_value.py").write_text(
+        "from value import value\n\ndef test_value():\n    assert value() == 1\n",
+        encoding="utf-8",
+    )
     git(target, "add", ".")
     git(target, "commit", "-m", "base")
     return target
@@ -53,18 +60,23 @@ class FakeLLM(BaseLLM):
         raise AssertionError("not used")
 
     def complete_json(self, system_prompt, user_prompt, *, max_tokens=4096):
-        return {
-            "probes": [
-                {
-                    "title": "value remains one",
-                    "source": "from value import value\ndef test_value():\n    assert value() == 1",
-                    "oracle": "the public documentation guarantees the value remains one",
-                    "oracle_provenance": "documentation",
-                    "changed_file": "value.py",
-                    "changed_symbol": "value",
-                }
-            ]
-        }
+        if '"hypotheses"' in system_prompt:
+            target = re.search(r"\[(target_[a-f0-9]{16})\] value\.py::value", user_prompt)
+            oracle = re.search(r"\[(oracle_[a-f0-9]{16})\]", user_prompt)
+            assert target is not None
+            assert oracle is not None
+            return {
+                "hypotheses": [
+                    {
+                        "title": "value remains one",
+                        "category": "defaults_compatibility",
+                        "target_id": target.group(1),
+                        "behavior": "the public value remains one",
+                        "oracle_id": oracle.group(1),
+                    }
+                ]
+            }
+        return {"source": "from value import value\ndef test_value():\n    assert value() == 1"}
 
 
 class FakeExecutor:
@@ -75,9 +87,13 @@ class FakeExecutor:
         self.base_sha = revisions[0][1].sha
 
     def execute(self, revision, artifact, *, repetition):
-        if revision.sha == self.base_sha:
-            return ExecutionResult.passed()
-        return ExecutionResult.failed(failure_signature="AssertionError:value")
+        source = revision.workspace / "value.py"
+        if revision.sha == self.base_sha or "return 1" in source.read_text(encoding="utf-8"):
+            return ExecutionResult.passed(metadata={"environment_integrity": "verified"})
+        return ExecutionResult.failed(
+            failure_signature="AssertionError:value",
+            metadata={"environment_integrity": "verified"},
+        )
 
 
 def factory(*_args):
@@ -103,19 +119,61 @@ def test_full_workflow_writes_gating_evidence_without_touching_checkout(
     before_worktrees = git(repo, "worktree", "list", "--porcelain")
 
     outcome = run_check(
-        CheckOptions(repo, range_spec="main...HEAD", state_root=tmp_path / "state"),
+        CheckOptions(
+            repo,
+            range_spec="main...HEAD",
+            intent=("preserve: The public documentation guarantees the value remains one.",),
+            state_root=tmp_path / "state",
+        ),
         llm=FakeLLM(),
         executor_factory=factory,
     )
 
     assert len(outcome.gating_findings) == 1
+    assert outcome.verdict.value == "regression_found"
     assert outcome.report_paths["sarif"].is_file()
     assert outcome.run.manifest["status"] == "complete"
     configuration = outcome.run.manifest["configuration"]
     assert configuration["limits"]["repeat"] == 3
     assert configuration["adapters"][0]["image"].startswith("python:")
+    analysis = RunStore.read_json(outcome.run.path / "analysis" / "pytest.json")
+    assert analysis["portfolio"]["accepted_probe_count"] == 1
+    assert any(target["symbol"] == "value" for target in analysis["change_graph"]["targets"])
+    assert outcome.findings[0].probe_metadata["change_target_id"].startswith("target_")
+    assert outcome.findings[0].probe_metadata["oracle_id"].startswith("oracle_")
+    assert outcome.findings[0].evidence is not None
+    assert outcome.findings[0].evidence.target_intervention_verified is True
+    assert outcome.findings[0].evidence.target_intervention_repetitions == 3
     assert git(repo, "status", "--porcelain=v1") == before_status
     assert git(repo, "worktree", "list", "--porcelain") == before_worktrees
+
+
+def test_stable_failure_that_survives_target_revert_remains_advisory(
+    repo: Path, tmp_path: Path
+) -> None:
+    git(repo, "checkout", "-b", "feature")
+    (repo / "value.py").write_text("def value(): return 2\n", encoding="utf-8")
+    git(repo, "commit", "-am", "change")
+
+    class UnrelatedFailureExecutor(FakeExecutor):
+        def execute(self, revision, artifact, *, repetition):
+            if revision.sha == self.base_sha:
+                return ExecutionResult.passed(metadata={"environment_integrity": "verified"})
+            return ExecutionResult.failed(
+                failure_signature="unrelated",
+                metadata={"environment_integrity": "verified"},
+            )
+
+    outcome = run_check(
+        CheckOptions(repo, range_spec="main...HEAD", state_root=tmp_path / "state"),
+        llm=FakeLLM(),
+        executor_factory=lambda *_args: UnrelatedFailureExecutor(),
+    )
+
+    assert outcome.verdict.value == "change_observed"
+    assert outcome.gating_findings == ()
+    assert outcome.findings[0].evidence is not None
+    assert outcome.findings[0].evidence.target_intervention_verified is False
 
 
 def test_invalid_probe_evidence_marks_run_incomplete(repo: Path, tmp_path: Path) -> None:
@@ -132,6 +190,93 @@ def test_invalid_probe_evidence_marks_run_incomplete(repo: Path, tmp_path: Path)
     assert outcome.incomplete is True
     assert outcome.run.manifest["status"] == "incomplete"
     assert outcome.gating_findings == ()
+
+
+def test_candidate_cannot_replace_reviewed_repository_policy(repo: Path, tmp_path: Path) -> None:
+    (repo / ".evalyn.yml").write_text("version: 1\n", encoding="utf-8")
+    git(repo, "add", ".evalyn.yml")
+    git(repo, "commit", "-m", "base policy")
+    git(repo, "checkout", "-b", "feature")
+    (repo / ".evalyn.yml").write_text(
+        "version: 1\nlimits:\n  max_tests: 50\n",
+        encoding="utf-8",
+    )
+    (repo / "value.py").write_text("def value(): return 2\n", encoding="utf-8")
+    git(repo, "add", ".")
+    git(repo, "commit", "-m", "change policy and code")
+
+    with pytest.raises(CheckError, match="differs from the selected base"):
+        inspect_check(CheckOptions(repo, range_spec="main...HEAD"))
+
+    operator_config = tmp_path / "reviewed-operator.yml"
+    operator_config.write_text("version: 1\n", encoding="utf-8")
+    inspection = inspect_check(
+        CheckOptions(
+            repo,
+            range_spec="main...HEAD",
+            config_path=operator_config,
+        )
+    )
+
+    assert inspection.settings.repo_path == repo.resolve()
+
+
+def test_ignored_working_config_cannot_bypass_reviewed_policy(repo: Path) -> None:
+    (repo / ".gitignore").write_text(".evalyn.yml\n", encoding="utf-8")
+    git(repo, "add", ".gitignore")
+    git(repo, "commit", "-m", "ignore local config")
+    git(repo, "checkout", "-b", "feature")
+    (repo / "value.py").write_text("def value(): return 2\n", encoding="utf-8")
+    git(repo, "commit", "-am", "change code")
+    (repo / ".evalyn.yml").write_text(
+        "version: 1\nlimits:\n  max_tests: 50\n",
+        encoding="utf-8",
+    )
+
+    assert git(repo, "status", "--porcelain=v1") == ""
+    with pytest.raises(CheckError, match="differs from the selected base"):
+        inspect_check(CheckOptions(repo, range_spec="main...HEAD"))
+
+
+def test_skip_worktree_config_edit_cannot_bypass_reviewed_policy(repo: Path) -> None:
+    config = repo / ".evalyn.yml"
+    config.write_text("version: 1\n", encoding="utf-8")
+    git(repo, "add", ".evalyn.yml")
+    git(repo, "commit", "-m", "base policy")
+    git(repo, "checkout", "-b", "feature")
+    (repo / "value.py").write_text("def value(): return 2\n", encoding="utf-8")
+    git(repo, "commit", "-am", "change code")
+    git(repo, "update-index", "--skip-worktree", ".evalyn.yml")
+    config.write_text(
+        "version: 1\nlimits:\n  max_tests: 50\n",
+        encoding="utf-8",
+    )
+
+    try:
+        assert git(repo, "status", "--porcelain=v1") == ""
+        with pytest.raises(CheckError, match="differs from the selected base"):
+            inspect_check(CheckOptions(repo, range_spec="main...HEAD"))
+    finally:
+        git(repo, "update-index", "--no-skip-worktree", ".evalyn.yml")
+
+
+def test_ignored_linked_working_config_is_rejected(repo: Path, tmp_path: Path) -> None:
+    (repo / ".gitignore").write_text(".evalyn.yml\n", encoding="utf-8")
+    git(repo, "add", ".gitignore")
+    git(repo, "commit", "-m", "ignore local config")
+    git(repo, "checkout", "-b", "feature")
+    (repo / "value.py").write_text("def value(): return 2\n", encoding="utf-8")
+    git(repo, "commit", "-am", "change code")
+    outside = tmp_path / "operator.yml"
+    outside.write_text("version: 1\n", encoding="utf-8")
+    try:
+        (repo / ".evalyn.yml").symlink_to(outside)
+    except OSError:
+        pytest.skip("file symlinks are unavailable")
+
+    assert git(repo, "status", "--porcelain=v1") == ""
+    with pytest.raises(SettingsError, match="symlink"):
+        inspect_check(CheckOptions(repo, range_spec="main...HEAD"))
 
 
 def test_builtin_provider_timeout_uses_remaining_check_budget(
@@ -162,6 +307,31 @@ def test_builtin_provider_timeout_uses_remaining_check_budget(
 
     assert len(observed) == 1
     assert 0 < observed[0] <= 7
+
+
+def test_workflow_runs_collection_preflight_on_passing_base(repo: Path, tmp_path: Path) -> None:
+    git(repo, "checkout", "-b", "feature")
+    (repo / "value.py").write_text("def value(): return 2\n", encoding="utf-8")
+    git(repo, "commit", "-am", "change")
+
+    class PreflightExecutor(FakeExecutor):
+        def __init__(self):
+            super().__init__()
+            self.preflight_calls: list[tuple[str, str]] = []
+
+        def preflight(self, revision, source):
+            self.preflight_calls.append((revision.sha, source))
+
+    executor = PreflightExecutor()
+    run_check(
+        CheckOptions(repo, range_spec="main...HEAD", state_root=tmp_path / "state"),
+        llm=FakeLLM(),
+        executor_factory=lambda *_args: executor,
+    )
+
+    assert len(executor.preflight_calls) == 1
+    assert executor.preflight_calls[0][0] == executor.base_sha
+    assert "def test_value" in executor.preflight_calls[0][1]
 
 
 def test_settings_snapshot_can_pin_the_resolved_container_runtime(tmp_path: Path) -> None:
@@ -199,6 +369,17 @@ def test_dirty_checkout_requires_explicit_snapshot(repo: Path) -> None:
 
     with pytest.raises(CheckError, match="--include-dirty"):
         inspect_check(CheckOptions(repo, range_spec="HEAD...HEAD"))
+
+
+def test_deleted_files_are_retained_as_change_targets(repo: Path) -> None:
+    git(repo, "checkout", "-b", "delete-value")
+    (repo / "value.py").unlink()
+    git(repo, "add", "value.py")
+    git(repo, "commit", "-m", "delete value")
+
+    inspection = inspect_check(CheckOptions(repo, range_spec="main...HEAD"))
+
+    assert inspection.changed_files == ("value.py",)
 
 
 def test_setup_failure_is_incomplete_and_preserves_checkout(repo: Path, tmp_path: Path) -> None:

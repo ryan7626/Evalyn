@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from dataclasses import replace
 from hashlib import sha256
 from typing import Protocol, runtime_checkable
 
@@ -16,7 +17,9 @@ from evalyn.engine.classifier import DifferentialClassifier
 from evalyn.engine.models import (
     ArtifactMetadata,
     ClassificationKind,
+    ClassificationResult,
     DifferentialRunResult,
+    EvidenceVector,
     ExecutionRecord,
     ExecutionResult,
     ExecutionStatus,
@@ -55,11 +58,15 @@ class DifferentialEngine:
         executor: ProbeExecutor,
         classifier: DifferentialClassifier | None = None,
         assessor: FindingAssessor | None = None,
+        adaptive: bool = True,
+        confirm_improvements: bool = False,
     ) -> None:
         self.adapter = adapter
         self.executor = executor
         self.classifier = classifier or DifferentialClassifier()
         self.assessor = assessor
+        self.adaptive = adaptive
+        self.confirm_improvements = confirm_improvements
 
     def evaluate(
         self,
@@ -81,20 +88,10 @@ class DifferentialEngine:
         findings: list[Finding] = []
 
         for probe, artifact in prepared:
-            base_records: list[ExecutionRecord] = []
-            candidate_records: list[ExecutionRecord] = []
-
-            # Interleaving sides limits temporal drift while preserving the exact
-            # same frozen artifact object for all six calls.
-            for repetition in range(1, self.classifier.repetitions + 1):
-                base_records.append(self._execute("base", base, artifact, repetition))
-                candidate_records.append(
-                    self._execute("candidate", candidate, artifact, repetition)
-                )
-
-            classification = self.classifier.classify(
-                [record.result for record in base_records],
-                [record.result for record in candidate_records],
+            base_records, candidate_records, classification = self._evaluate_artifact(
+                base,
+                candidate,
+                artifact,
             )
             artifact_metadata = self._artifact_metadata(artifact)
             assessment = ProbeAssessment(
@@ -126,8 +123,17 @@ class DifferentialEngine:
                     oracle=probe.oracle,
                     oracle_provenance=probe.oracle_provenance,
                     probe_metadata=dict(probe.metadata),
+                    evidence=self._evidence_vector(
+                        probe,
+                        tuple(base_records),
+                        tuple(candidate_records),
+                    ),
                 )
-                findings.append(self._assess_finding(finding))
+                findings.append(finding)
+
+        findings = [
+            self._assess_finding(finding) for finding in self._with_corroboration(tuple(findings))
+        ]
 
         return DifferentialRunResult(
             run_id=actual_run_id,
@@ -136,6 +142,210 @@ class DifferentialEngine:
             adapter=self.adapter.name,
             assessments=tuple(assessments),
             findings=tuple(findings),
+        )
+
+    @staticmethod
+    def _with_corroboration(findings: tuple[Finding, ...]) -> tuple[Finding, ...]:
+        """Count independent causal probes supporting the same target contract."""
+
+        groups: dict[tuple[str, str, str], set[str]] = {}
+        for finding in findings:
+            evidence = finding.evidence
+            if not (
+                evidence is not None
+                and evidence.environment_integrity
+                and evidence.target_binding_verified
+                and evidence.oracle_binding_verified
+                and evidence.target_intervention_verified
+            ):
+                continue
+            metadata = finding.probe_metadata
+            target = metadata.get("change_target_id") or "::".join(
+                (
+                    metadata.get("changed_file", ""),
+                    metadata.get("changed_symbol", ""),
+                )
+            )
+            key = (
+                target,
+                metadata.get("oracle_grounding_source", ""),
+                finding.oracle,
+            )
+            groups.setdefault(key, set()).add(finding.artifact.probe_id)
+
+        enriched: list[Finding] = []
+        for finding in findings:
+            metadata = dict(finding.probe_metadata)
+            target = metadata.get("change_target_id") or "::".join(
+                (metadata.get("changed_file", ""), metadata.get("changed_symbol", ""))
+            )
+            key = (
+                target,
+                metadata.get("oracle_grounding_source", ""),
+                finding.oracle,
+            )
+            count = max(1, len(groups.get(key, set())))
+            metadata["corroboration_count"] = str(count)
+            evidence = (
+                replace(finding.evidence, corroboration_count=count)
+                if finding.evidence is not None
+                else None
+            )
+            enriched.append(replace(finding, probe_metadata=metadata, evidence=evidence))
+        return tuple(enriched)
+
+    def _evaluate_artifact(
+        self,
+        base: Revision,
+        candidate: Revision,
+        artifact: ProbeArtifact,
+    ) -> tuple[list[ExecutionRecord], list[ExecutionRecord], ClassificationResult]:
+        """Run a cheap discovery pair and confirm only interesting transitions."""
+
+        base_records = [self._execute("base", base, artifact, 1)]
+        candidate_records = [self._execute("candidate", candidate, artifact, 1)]
+        if not self.adaptive:
+            self._append_confirmations(base, candidate, artifact, base_records, candidate_records)
+            return (
+                base_records,
+                candidate_records,
+                self.classifier.classify(
+                    [record.result for record in base_records],
+                    [record.result for record in candidate_records],
+                ),
+            )
+
+        base_result = base_records[0].result
+        candidate_result = candidate_records[0].result
+        invalid = {ExecutionStatus.INVALID_PROBE, ExecutionStatus.INFRA_ERROR}
+        failures = {ExecutionStatus.FAILED, ExecutionStatus.TIMEOUT}
+        if base_result.status in invalid or candidate_result.status in invalid:
+            return (
+                base_records,
+                candidate_records,
+                ClassificationResult(
+                    ClassificationKind.INVALID,
+                    "discovery execution was an invalid probe or infrastructure error",
+                ),
+            )
+        if base_result.status == ExecutionStatus.PASSED and candidate_result.status in failures:
+            self._append_confirmations(base, candidate, artifact, base_records, candidate_records)
+            return (
+                base_records,
+                candidate_records,
+                self.classifier.classify(
+                    [record.result for record in base_records],
+                    [record.result for record in candidate_records],
+                ),
+            )
+        if (
+            self.confirm_improvements
+            and base_result.status in failures
+            and candidate_result.status == ExecutionStatus.PASSED
+        ):
+            self._append_confirmations(base, candidate, artifact, base_records, candidate_records)
+            return (
+                base_records,
+                candidate_records,
+                self.classifier.classify(
+                    [record.result for record in base_records],
+                    [record.result for record in candidate_records],
+                ),
+            )
+        if (
+            base_result.status == ExecutionStatus.PASSED
+            and candidate_result.status == ExecutionStatus.PASSED
+        ):
+            return (
+                base_records,
+                candidate_records,
+                ClassificationResult(
+                    ClassificationKind.UNCHANGED,
+                    "probe passed the base and candidate discovery executions; "
+                    "no differential was observed",
+                ),
+            )
+        if base_result.status in failures and candidate_result.status == ExecutionStatus.PASSED:
+            return (
+                base_records,
+                candidate_records,
+                ClassificationResult(
+                    ClassificationKind.IMPROVEMENT,
+                    "probe failed base and passed candidate during discovery",
+                ),
+            )
+        if base_result.status in failures:
+            return (
+                base_records,
+                candidate_records,
+                ClassificationResult(
+                    ClassificationKind.BASELINE_FAILURE,
+                    "probe did not establish passing base behavior during discovery",
+                ),
+            )
+        return (
+            base_records,
+            candidate_records,
+            ClassificationResult(
+                ClassificationKind.UNSTABLE,
+                "base or candidate discovery outcome could not establish a causal transition",
+            ),
+        )
+
+    def _append_confirmations(
+        self,
+        base: Revision,
+        candidate: Revision,
+        artifact: ProbeArtifact,
+        base_records: list[ExecutionRecord],
+        candidate_records: list[ExecutionRecord],
+    ) -> None:
+        # Interleaving sides limits temporal drift while preserving the exact
+        # same frozen artifact object for every confirmation call.
+        for repetition in range(2, self.classifier.repetitions + 1):
+            base_records.append(self._execute("base", base, artifact, repetition))
+            candidate_records.append(self._execute("candidate", candidate, artifact, repetition))
+
+    @staticmethod
+    def _evidence_vector(
+        probe: ProbeSource,
+        base_records: tuple[ExecutionRecord, ...],
+        candidate_records: tuple[ExecutionRecord, ...],
+    ) -> EvidenceVector:
+        metadata = probe.metadata
+        try:
+            corroboration = max(1, int(metadata.get("corroboration_count", "1")))
+        except (TypeError, ValueError):
+            corroboration = 1
+        try:
+            intervention_repetitions = max(
+                0, int(metadata.get("target_intervention_repetitions", "0"))
+            )
+        except (TypeError, ValueError):
+            intervention_repetitions = 0
+        executions = (*base_records, *candidate_records)
+        environment_integrity = bool(executions) and all(
+            record.result.metadata.get("environment_integrity") == "verified"
+            for record in executions
+        )
+        return EvidenceVector(
+            causal_transition="base_pass_candidate_fail",
+            base_repetitions=len(base_records),
+            candidate_repetitions=len(candidate_records),
+            repeatable=True,
+            oracle_kind=probe.oracle_provenance or "none",
+            oracle_source=metadata.get("oracle_grounding_source", ""),
+            target_file=metadata.get("changed_file", ""),
+            target_symbol=metadata.get("changed_symbol", ""),
+            target_binding_verified=metadata.get("target_binding") == "static_reference",
+            oracle_binding_verified=metadata.get("oracle_binding") == "static_assertion_match",
+            target_intervention_verified=(
+                metadata.get("target_intervention") == "candidate_target_revert_passed"
+                and intervention_repetitions >= 3
+            ),
+            target_intervention_repetitions=intervention_repetitions,
+            corroboration_count=corroboration,
+            environment_integrity=environment_integrity,
         )
 
     def _assess_finding(self, finding: Finding) -> Finding:

@@ -219,6 +219,61 @@ def test_absolute_custom_engine_skips_context_discovery(
     assert _resolve_container_client_environment("/tmp/docker", "/tmp/docker") == {}
 
 
+@pytest.mark.parametrize(
+    ("engine", "variable", "endpoint"),
+    [
+        ("docker", "DOCKER_HOST", "tcp://builder.example.test:2376"),
+        ("docker", "DOCKER_HOST", "ssh://builder.example.test"),
+        ("podman", "CONTAINER_HOST", "tcp://builder.example.test:2376"),
+        ("podman", "CONTAINER_HOST", "ssh://builder.example.test/run/podman.sock"),
+    ],
+)
+def test_remote_container_endpoints_require_explicit_operator_opt_in(
+    monkeypatch: pytest.MonkeyPatch,
+    engine: str,
+    variable: str,
+    endpoint: str,
+) -> None:
+    monkeypatch.delenv("DOCKER_HOST", raising=False)
+    monkeypatch.delenv("CONTAINER_HOST", raising=False)
+    monkeypatch.setenv(variable, endpoint)
+
+    with pytest.raises(ValueError, match="explicit operator opt-in"):
+        _resolve_container_client_environment(engine, f"/usr/bin/{engine}")
+
+    assert (
+        _resolve_container_client_environment(
+            engine,
+            f"/usr/bin/{engine}",
+            allow_remote_endpoint=True,
+        )[variable]
+        == endpoint
+    )
+
+
+def test_remote_endpoint_scope_is_recorded_without_persisting_the_endpoint(
+    tmp_path: Path,
+    fake_engine: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, _calls = fake_engine
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    endpoint = "tcp://builder.example.test:2376"
+    monkeypatch.setenv("DOCKER_HOST", endpoint)
+
+    with ContainerRunner(
+        workspace,
+        image="evalyn-tests:local",
+        engine=str(engine),
+        allow_remote_endpoint=True,
+    ) as runner:
+        payload = runner.environment_fingerprint.to_dict()
+
+    assert payload["endpoint_scope"] == "remote"
+    assert endpoint not in json.dumps(payload)
+
+
 def test_allowlisted_setup_secret_uses_ephemeral_env_file_not_argv(
     tmp_path: Path,
     fake_engine: tuple[Path, Path],

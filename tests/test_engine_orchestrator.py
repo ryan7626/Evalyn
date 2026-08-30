@@ -97,6 +97,7 @@ def test_stable_change_creates_finding_with_artifact_metadata(tmp_path):
     ]
     assert finding.to_dict()["semantic_state"] == "uncertain_change"
     assert result.to_dict()["assessments"][0]["classification"]["kind"] == "stable_change"
+    assert result.to_dict()["verdict"] == "change_observed"
     assert result.gating_findings == ()
 
 
@@ -116,9 +117,10 @@ def test_finding_id_and_run_id_are_deterministic(tmp_path):
 
 
 def test_unchanged_probe_has_assessment_but_no_finding(tmp_path):
+    executor = RecordingExecutor(candidate_fails=False)
     engine = DifferentialEngine(
         PytestAdapter(),
-        RecordingExecutor(candidate_fails=False),
+        executor,
     )
     base, candidate = revisions(tmp_path)
 
@@ -129,7 +131,22 @@ def test_unchanged_probe_has_assessment_but_no_finding(tmp_path):
     )
 
     assert result.assessments[0].classification.kind == ClassificationKind.UNCHANGED
+    assert len(executor.calls) == 2
+    assert len(result.assessments[0].base_runs) == 1
+    assert len(result.assessments[0].candidate_runs) == 1
+    assert result.to_dict()["verdict"] == "no_differential_observed"
     assert result.findings == ()
+
+
+def test_nonadaptive_mode_preserves_full_repetition_for_clean_probe(tmp_path):
+    executor = RecordingExecutor(candidate_fails=False)
+    engine = DifferentialEngine(PytestAdapter(), executor, adaptive=False)
+    base, candidate = revisions(tmp_path)
+
+    result = engine.evaluate(base, candidate, [ProbeSource("def test_probe():\n    assert True")])
+
+    assert len(executor.calls) == 6
+    assert result.assessments[0].classification.kind == ClassificationKind.UNCHANGED
 
 
 def test_duplicate_probe_source_is_executed_once(tmp_path):

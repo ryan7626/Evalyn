@@ -37,11 +37,20 @@ from evalyn.execution import (
 )
 from evalyn.execution.bounded import BoundedProcessResult, run_bounded_process
 from evalyn.execution.git_safety import sanitized_git_command, sanitized_git_environment
+from evalyn.execution.structured_results import PYTEST_REPORTER_SOURCE
 from evalyn.llm import create_provider
 from evalyn.llm.base import BaseLLM
 from evalyn.probe_executor import DEFAULT_IMAGES, ContainerProbeExecutor
 from evalyn.run_store import RunStore, StoredRun
-from evalyn.settings import AdapterSettings, EvalynSettings, ProviderSettings, load_settings
+from evalyn.settings import (
+    MAX_BUDGET_SECONDS,
+    MAX_REPEAT,
+    AdapterSettings,
+    EvalynSettings,
+    ProviderSettings,
+    load_settings,
+    resolve_settings_path,
+)
 
 
 class RepairError(RuntimeError):
@@ -69,6 +78,9 @@ class _RecordedRepairConfiguration:
     setup_env_names: tuple[str, ...]
     repetitions: int
     budget_seconds: int
+    allow_remote_endpoint: bool
+    expected_image_identity: str | None
+    expected_endpoint_scope: str | None
 
 
 class RepairExecutor(Protocol):
@@ -216,6 +228,7 @@ def repair_saved_finding(
     llm: BaseLLM | None = None,
     executor_factory: RepairExecutorFactory | None = None,
     max_attempts: int = 3,
+    allow_remote_endpoint: bool = False,
 ) -> Path:
     """Validate model repair hypotheses and atomically emit the first safe patch.
 
@@ -224,8 +237,12 @@ def repair_saved_finding(
     """
     if not isinstance(finding_id, str) or not _FINDING_ID.fullmatch(finding_id):
         raise RepairError("finding_id must match EVL-XXXXXXXX")
-    if not isinstance(max_attempts, int) or isinstance(max_attempts, bool) or max_attempts < 1:
-        raise RepairError("max_attempts must be a positive integer")
+    if (
+        not isinstance(max_attempts, int)
+        or isinstance(max_attempts, bool)
+        or not 1 <= max_attempts <= MAX_REPEAT
+    ):
+        raise RepairError(f"max_attempts must be an integer between 1 and {MAX_REPEAT}")
     if runtime not in {None, "docker", "podman"}:
         raise RepairError("runtime must be docker, podman, or omitted")
 
@@ -248,6 +265,7 @@ def repair_saved_finding(
                 llm=llm,
                 executor_factory=executor_factory,
                 max_attempts=max_attempts,
+                allow_remote_endpoint=allow_remote_endpoint,
             )
     except RepairError:
         raise
@@ -269,6 +287,7 @@ def _repair_saved_finding_locked(
     llm: BaseLLM | None,
     executor_factory: RepairExecutorFactory | None,
     max_attempts: int,
+    allow_remote_endpoint: bool,
 ) -> Path:
     """Run all state-dependent repair work while the repository lock is held."""
     located = store.find_finding(finding_id)
@@ -278,9 +297,14 @@ def _repair_saved_finding_locked(
     _validate_stored_run(store, run)
     finding = _load_owned_finding(run, finding_id)
     repo = _validate_stored_repository(store, run)
-    settings = _load_repair_settings(repo, config_path)
     adapter, artifact = _load_artifact(finding)
     recorded = _load_recorded_configuration(run, adapter.name)
+    settings = _load_repair_settings(repo, config_path, run=run)
+    if allow_remote_endpoint != recorded.allow_remote_endpoint:
+        raise RepairError(
+            "Remote container endpoint opt-in must match the saved check; "
+            "pass the explicit operator flag again only for a remotely-created run"
+        )
     adapter_settings = recorded.adapter_settings
     base_sha, candidate_sha, candidate_id = _stored_revisions(run, finding)
     evidence = _validate_finding_evidence(
@@ -294,7 +318,16 @@ def _repair_saved_finding_locked(
     factory = executor_factory or partial(
         _default_executor_factory,
         setup_env_names=recorded.setup_env_names,
+        allow_remote_endpoint=allow_remote_endpoint,
+        expected_image_identity=recorded.expected_image_identity,
+        expected_endpoint_scope=recorded.expected_endpoint_scope,
     )
+    if executor_factory is None and (
+        recorded.expected_image_identity is None or recorded.expected_endpoint_scope is None
+    ):
+        raise RepairError(
+            "Stored run has no complete execution-environment identity for exact repair replay"
+        )
 
     feedback: list[str] = []
     deadline = time.monotonic() + recorded.budget_seconds
@@ -354,7 +387,19 @@ def _repair_saved_finding_locked(
                 run=run,
                 base_sha=base_sha,
                 candidate_sha=candidate_sha,
+                candidate_id=candidate_id,
                 patch=candidate_patch,
+                adapter=adapter,
+                adapter_settings=adapter_settings,
+                artifact=artifact,
+                suite_argv=suite_argv,
+                factory=factory,
+                runtime=effective_runtime,
+                deadline=deadline,
+                repetitions=max(3, evidence.repetitions),
+                run_path=(
+                    run.path / "repairs" / repair_key / f"final-{attempt}-{uuid.uuid4().hex[:12]}"
+                ),
                 worktree_parent=store.repo_root / "worktrees",
             )
             verified_patch = candidate_patch
@@ -604,10 +649,20 @@ def _verify_patch_against_fresh_candidate(
     run: StoredRun,
     base_sha: str,
     candidate_sha: str,
+    candidate_id: str,
     patch: bytes,
+    adapter: TestAdapter,
+    adapter_settings: AdapterSettings,
+    artifact: ProbeArtifact,
+    suite_argv: tuple[str, ...],
+    factory: RepairExecutorFactory,
+    runtime: str | None,
+    deadline: float,
+    repetitions: int,
+    run_path: Path,
     worktree_parent: Path,
 ) -> None:
-    """Reconstruct saved state once more before permitting patch emission."""
+    """Apply and fully validate the patch in a newly reconstructed candidate."""
     with WorktreeSession(
         repo,
         baseline_revision=base_sha,
@@ -615,7 +670,239 @@ def _verify_patch_against_fresh_candidate(
         temp_parent=worktree_parent,
     ) as worktrees:
         _restore_saved_overlay(run, worktrees)
-        _check_patch_applies(worktrees.candidate_path, patch)
+        workspace = worktrees.candidate_path
+        _apply_repair_patch(workspace, patch)
+        expected_tracked = _tracked_diff(workspace)
+        probe_path = _materialize_saved_probe(workspace, artifact)
+        support_paths = _materialize_probe_support(workspace, adapter.name)
+        revision = Revision(candidate_id, workspace)
+        validation_budget = math.ceil(deadline - time.monotonic())
+        if validation_budget <= 0:
+            raise RepairError("Repair execution budget was exhausted before final verification")
+        executor = factory(
+            adapter,
+            adapter_settings,
+            run_path,
+            runtime,
+            validation_budget,
+        )
+        executor.prepare(revision)
+        if executor.setup_errors:
+            details = "; ".join(str(value) for value in executor.setup_errors.values())
+            raise RepairError(f"Final repair verification setup failed: {details}")
+        _assert_probe_unchanged(probe_path, artifact)
+        _assert_support_unchanged(support_paths)
+        expected_untracked = _untracked_state(workspace)
+        _assert_final_workspace_state(
+            workspace,
+            expected_tracked=expected_tracked,
+            expected_untracked=expected_untracked,
+            probe_path=probe_path,
+            artifact=artifact,
+            run=run,
+            support_paths=support_paths,
+        )
+
+        results = executor.validate_probe(
+            revision,
+            artifact,
+            repetitions=repetitions,
+        )
+        if len(results) != repetitions:
+            raise RepairError(
+                f"Repair executor did not return exactly {repetitions} final probe results"
+            )
+        _raise_for_infrastructure(results, "final probe")
+        if any(result.status != ExecutionStatus.PASSED for result in results):
+            statuses = ", ".join(result.status.value for result in results)
+            raise _RetryableRepair(
+                f"Fresh repaired candidate did not pass the probe {repetitions}x ({statuses})"
+            )
+        _assert_final_workspace_state(
+            workspace,
+            expected_tracked=expected_tracked,
+            expected_untracked=expected_untracked,
+            probe_path=probe_path,
+            artifact=artifact,
+            run=run,
+            support_paths=support_paths,
+        )
+
+        suite_result = executor.validate_suite(revision, suite_argv)
+        _raise_for_infrastructure((suite_result,), "final full suite")
+        if suite_result.status != ExecutionStatus.PASSED:
+            raise _RetryableRepair(
+                "Fresh repaired candidate failed full suite: " + _result_fingerprint(suite_result)
+            )
+        _assert_final_workspace_state(
+            workspace,
+            expected_tracked=expected_tracked,
+            expected_untracked=expected_untracked,
+            probe_path=probe_path,
+            artifact=artifact,
+            run=run,
+            support_paths=support_paths,
+        )
+
+
+def _apply_repair_patch(workspace: Path, patch: bytes) -> None:
+    result = _run_sanitized_git(
+        workspace,
+        "apply",
+        "--binary",
+        "--whitespace=nowarn",
+        "-",
+        input_bytes=patch,
+        action="apply constructed repair patch",
+    )
+    if result.returncode != 0:
+        detail = result.stderr.decode("utf-8", errors="replace").strip()
+        raise RepairError(
+            f"Constructed repair patch does not apply to the fresh saved candidate: {detail}"
+        )
+
+
+def _materialize_saved_probe(workspace: Path, artifact: ProbeArtifact) -> Path:
+    try:
+        target = WorkspacePathPolicy(workspace).resolve_write(
+            artifact.relative_path.as_posix(),
+            protect_sensitive=False,
+        )
+        content = artifact.source.encode("utf-8")
+        if target.exists():
+            if RunStore.read_bytes(target, max_bytes=len(content)) != content:
+                raise RepairError("Fresh candidate probe path contains unexpected content")
+        else:
+            RunStore.write_bytes(target, content, mode=0o644)
+        return target
+    except RepairError:
+        raise
+    except (OSError, ValueError) as exc:
+        raise RepairError(
+            f"Could not materialize the saved probe for final verification: {exc}"
+        ) from exc
+
+
+def _materialize_probe_support(
+    workspace: Path, adapter_name: str
+) -> tuple[tuple[Path, bytes], ...]:
+    if adapter_name != "pytest":
+        return ()
+    content = PYTEST_REPORTER_SOURCE.encode("utf-8")
+    try:
+        target = WorkspacePathPolicy(workspace).resolve_write(
+            ".evalyn/probes/support/evalyn_pytest_reporter.py",
+            protect_sensitive=False,
+        )
+        if target.exists():
+            if RunStore.read_bytes(target, max_bytes=len(content)) != content:
+                raise RepairError("Fresh candidate reporter path contains unexpected content")
+        else:
+            RunStore.write_bytes(target, content, mode=0o444)
+        return ((target, content),)
+    except RepairError:
+        raise
+    except (OSError, ValueError) as exc:
+        raise RepairError(
+            f"Could not materialize trusted probe support for final verification: {exc}"
+        ) from exc
+
+
+def _untracked_state(workspace: Path) -> tuple[tuple[bytes, int, int, int], ...]:
+    result = _run_sanitized_git(
+        workspace,
+        "ls-files",
+        "--others",
+        "-z",
+        "--",
+        action="inspect candidate untracked validation state",
+    )
+    if result.returncode != 0:
+        detail = result.stderr.decode("utf-8", errors="replace").strip()
+        raise RepairError(f"Could not inspect candidate untracked validation state: {detail}")
+    entries: list[tuple[bytes, int, int, int]] = []
+    for raw_relative in result.stdout.split(b"\0"):
+        if not raw_relative:
+            continue
+        relative = raw_relative.decode("utf-8", errors="surrogateescape")
+        safe = _safe_relative(relative)
+        target = workspace.joinpath(*PurePosixPath(safe).parts)
+        try:
+            metadata = target.lstat()
+        except OSError as exc:
+            raise RepairError(f"Could not inspect untracked validation path: {relative!r}") from exc
+        entries.append((raw_relative, metadata.st_mode, metadata.st_size, metadata.st_mtime_ns))
+    return tuple(entries)
+
+
+def _assert_final_workspace_state(
+    workspace: Path,
+    *,
+    expected_tracked: bytes,
+    expected_untracked: tuple[tuple[bytes, int, int, int], ...],
+    probe_path: Path,
+    artifact: ProbeArtifact,
+    run: StoredRun,
+    support_paths: tuple[tuple[Path, bytes], ...],
+) -> None:
+    if _tracked_diff(workspace) != expected_tracked:
+        raise RepairError(
+            "Final repair verification modified tracked files; refusing to emit a patch"
+        )
+    if _untracked_state(workspace) != expected_untracked:
+        raise RepairError(
+            "Final repair verification created or modified unexpected untracked files"
+        )
+    _assert_probe_unchanged(probe_path, artifact)
+    _assert_support_unchanged(support_paths)
+    _assert_saved_untracked_unchanged(run, workspace)
+
+
+def _assert_probe_unchanged(path: Path, artifact: ProbeArtifact) -> None:
+    expected = artifact.source.encode("utf-8")
+    try:
+        observed = RunStore.read_bytes(path, max_bytes=len(expected))
+    except (OSError, ValueError) as exc:
+        raise RepairError("Final repair verification made the saved probe unreadable") from exc
+    if observed != expected:
+        raise RepairError("Final repair verification modified the saved probe")
+
+
+def _assert_support_unchanged(support_paths: tuple[tuple[Path, bytes], ...]) -> None:
+    for path, expected in support_paths:
+        try:
+            observed = RunStore.read_bytes(path, max_bytes=len(expected))
+        except (OSError, ValueError) as exc:
+            raise RepairError(
+                "Final repair verification made trusted probe support unreadable"
+            ) from exc
+        if observed != expected:
+            raise RepairError("Final repair verification modified trusted probe support")
+
+
+def _assert_saved_untracked_unchanged(run: StoredRun, workspace: Path) -> None:
+    metadata = run.manifest.get("dirty_overlay", {})
+    raw_paths = metadata.get("untracked", []) if isinstance(metadata, dict) else []
+    for raw_relative in raw_paths:
+        relative = _safe_relative(raw_relative)
+        stored = _contained_run_file(
+            run.path,
+            PurePosixPath("dirty-untracked", *PurePosixPath(relative).parts).as_posix(),
+        )
+        target = workspace.joinpath(*PurePosixPath(relative).parts)
+        try:
+            expected = RunStore.read_bytes(stored, max_bytes=_MAX_OVERLAY_BYTES)
+            observed = RunStore.read_bytes(target, max_bytes=len(expected))
+            expected_mode = stored.stat().st_mode & 0o777
+            observed_mode = target.stat().st_mode & 0o777
+        except (OSError, ValueError) as exc:
+            raise RepairError(
+                f"Final repair verification made saved untracked file unsafe: {relative}"
+            ) from exc
+        if observed != expected or observed_mode != expected_mode:
+            raise RepairError(
+                f"Final repair verification modified saved untracked file: {relative}"
+            )
 
 
 class _ContainerRepairExecutor:
@@ -627,6 +914,9 @@ class _ContainerRepairExecutor:
         runtime: str | None,
         timeout_seconds: int,
         setup_env_names: tuple[str, ...] = (),
+        allow_remote_endpoint: bool = False,
+        expected_image_identity: str | None = None,
+        expected_endpoint_scope: str | None = None,
     ) -> None:
         self.adapter = adapter
         self.settings = settings
@@ -642,6 +932,9 @@ class _ContainerRepairExecutor:
             setup_argv=settings.setup_argv,
             setup_env_names=setup_env_names,
             timeout_seconds=timeout_seconds,
+            allow_remote_endpoint=allow_remote_endpoint,
+            expected_image_identity=expected_image_identity,
+            expected_endpoint_scope=expected_endpoint_scope,
         )
 
     @property
@@ -673,11 +966,13 @@ class _ContainerRepairExecutor:
             timeout = self._probe.remaining_timeout()
             with ContainerRunner(
                 revision.workspace,
-                image=self.image,
+                image=self._probe.execution_image,
                 engine=self.runtime,
                 network="none",
                 pull_policy="missing",
+                workspace_read_only=True,
                 default_timeout_seconds=timeout,
+                allow_remote_endpoint=self._probe.allow_remote_endpoint,
             ) as runner:
                 result = runner.run(
                     argv,
@@ -736,6 +1031,9 @@ def _default_executor_factory(
     budget_seconds: int,
     *,
     setup_env_names: tuple[str, ...] = (),
+    allow_remote_endpoint: bool = False,
+    expected_image_identity: str | None = None,
+    expected_endpoint_scope: str | None = None,
 ) -> RepairExecutor:
     return _ContainerRepairExecutor(
         adapter,
@@ -744,6 +1042,9 @@ def _default_executor_factory(
         runtime,
         budget_seconds,
         setup_env_names,
+        allow_remote_endpoint,
+        expected_image_identity,
+        expected_endpoint_scope,
     )
 
 
@@ -811,9 +1112,35 @@ def _validate_stored_repository(store: RunStore, run: StoredRun) -> Path:
     return repo
 
 
-def _load_repair_settings(repo: Path, config_path: Path | None) -> EvalynSettings:
+def _load_repair_settings(
+    repo: Path,
+    config_path: Path | None,
+    *,
+    run: StoredRun,
+) -> EvalynSettings:
+    if config_path is None:
+        configuration = run.manifest.get("configuration")
+        provider = configuration.get("provider") if isinstance(configuration, dict) else None
+        kind = provider.get("kind") if isinstance(provider, dict) else None
+        model = provider.get("model") if isinstance(provider, dict) else None
+        if kind not in {"anthropic", "openai-compatible"}:
+            raise RepairError("Stored run has an invalid provider-kind snapshot")
+        if not isinstance(model, str) or not model.strip() or len(model) > 256 or "\x00" in model:
+            raise RepairError("Stored run has an invalid provider-model snapshot")
+        return EvalynSettings(
+            repo_path=repo,
+            provider=ProviderSettings(kind=kind, model=model),
+        )
     try:
-        return load_settings(repo, config_path)
+        requested = resolve_settings_path(repo, config_path)
+    except Exception as exc:
+        raise RepairError(f"Could not resolve repair settings: {exc}") from exc
+    if requested.is_relative_to(repo):
+        raise RepairError(
+            "Repair provider overrides require an explicit configuration outside the repository"
+        )
+    try:
+        return load_settings(repo, requested)
     except Exception as exc:
         raise RepairError(f"Could not load repair settings: {exc}") from exc
 
@@ -869,6 +1196,9 @@ def _load_recorded_configuration(
     )
     if any(not _is_setup_environment_name(name) for name in setup_env_names):
         raise RepairError("Stored run contains a non-package-registry setup environment name")
+    allow_remote_endpoint = sandbox.get("allow_remote_endpoint", False)
+    if not isinstance(allow_remote_endpoint, bool):
+        raise RepairError("Stored run has an invalid remote-endpoint snapshot")
 
     adapters = configuration.get("adapters")
     if not isinstance(adapters, list):
@@ -890,6 +1220,26 @@ def _load_recorded_configuration(
         or not _OCI_IMAGE.fullmatch(image)
     ):
         raise RepairError("Stored run has an invalid adapter image snapshot")
+    declared_image = adapter_snapshot.get("declared_image", image)
+    if (
+        not isinstance(declared_image, str)
+        or not declared_image
+        or declared_image != declared_image.strip()
+        or declared_image.startswith("-")
+        or not _OCI_IMAGE.fullmatch(declared_image)
+    ):
+        raise RepairError("Stored run has an invalid declared adapter image snapshot")
+    environments = run.manifest.get("environments", {})
+    environment = environments.get(adapter_name) if isinstance(environments, dict) else None
+    expected_image_identity: str | None = None
+    expected_endpoint_scope: str | None = None
+    if isinstance(environment, dict):
+        resolved = environment.get("resolved_image_identity")
+        endpoint = environment.get("endpoint_scope")
+        if isinstance(resolved, str) and re.fullmatch(r"sha256:[0-9a-f]{64}", resolved):
+            expected_image_identity = resolved
+        if endpoint in {"local", "remote"}:
+            expected_endpoint_scope = endpoint
     setup_argv = _recorded_argv(adapter_snapshot.get("setup_argv"), "adapter setup command")
     suite_argv = _recorded_argv(adapter_snapshot.get("suite_argv"), "adapter suite command")
 
@@ -898,21 +1248,21 @@ def _load_recorded_configuration(
     if (
         not isinstance(repetitions, int)
         or isinstance(repetitions, bool)
-        or not 2 <= repetitions <= 10
+        or not 2 <= repetitions <= MAX_REPEAT
     ):
         raise RepairError("Stored run has an invalid repeat-count snapshot")
     budget_seconds = limits.get("budget_seconds") if isinstance(limits, dict) else None
     if (
         not isinstance(budget_seconds, int)
         or isinstance(budget_seconds, bool)
-        or budget_seconds <= 0
+        or not 1 <= budget_seconds <= MAX_BUDGET_SECONDS
     ):
         raise RepairError("Stored run has an invalid execution-budget snapshot")
 
     return _RecordedRepairConfiguration(
         adapter_settings=AdapterSettings(
             name=adapter_name,
-            image=image,
+            image=declared_image,
             setup_argv=setup_argv,
             suite_argv=suite_argv,
         ),
@@ -920,6 +1270,9 @@ def _load_recorded_configuration(
         setup_env_names=setup_env_names,
         repetitions=repetitions,
         budget_seconds=budget_seconds,
+        allow_remote_endpoint=allow_remote_endpoint,
+        expected_image_identity=expected_image_identity,
+        expected_endpoint_scope=expected_endpoint_scope,
     )
 
 
@@ -1526,6 +1879,7 @@ def _suite_environment(adapter_name: str) -> dict[str, str]:
         return {
             "PATH": "/workspace/.evalyn/venv/bin:/usr/local/bin:/usr/bin:/bin",
             "PYTHONPATH": "/workspace",
+            "PYTHONDONTWRITEBYTECODE": "1",
         }
     return {"CI": "1"}
 

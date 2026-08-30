@@ -86,5 +86,7 @@ class PytestAdapter(TestAdapter):
             "--maxfail=1",
             "-p",
             "no:cacheprovider",
+            "-p",
+            "evalyn_pytest_reporter",
             relative_path.as_posix(),
         )

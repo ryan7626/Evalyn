@@ -7,6 +7,7 @@ does.
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -16,7 +17,10 @@ import yaml
 
 from evalyn.run_store import RunStore
 
-_MAX_CONFIG_BYTES = 256 * 1024
+MAX_CONFIG_BYTES = 256 * 1024
+MAX_TESTS = 100
+MAX_REPEAT = 10
+MAX_BUDGET_SECONDS = 24 * 60 * 60
 
 
 class SettingsError(ValueError):
@@ -55,19 +59,40 @@ class EvalynSettings:
     budget_seconds: int = 600
 
 
+def resolve_settings_path(repo_path: Path, config_path: Path | None = None) -> Path:
+    """Resolve the selected configuration without accepting linked components."""
+    repo = repo_path.resolve()
+    requested = config_path.expanduser() if config_path is not None else repo / ".evalyn.yml"
+    candidate = requested if requested.is_absolute() else repo / requested
+    path = Path(os.path.abspath(os.fspath(candidate)))
+    _reject_linked_config_path(path)
+    try:
+        resolved = path.resolve(strict=True)
+    except FileNotFoundError:
+        try:
+            resolved = path.resolve(strict=False)
+        except (OSError, RuntimeError) as exc:
+            raise SettingsError(f"Could not resolve configuration path {path}: {exc}") from exc
+    except (OSError, RuntimeError) as exc:
+        raise SettingsError(f"Could not resolve configuration path {path}: {exc}") from exc
+    # Recheck after resolution so a component swapped to a link while resolving
+    # is rejected before the path is used for either trust classification or IO.
+    _reject_linked_config_path(path)
+    return resolved
+
+
 def load_settings(repo_path: Path, config_path: Path | None = None) -> EvalynSettings:
     """Load optional schema-version-1 repository configuration."""
     repo = repo_path.resolve()
-    path = config_path.expanduser() if config_path else repo / ".evalyn.yml"
-    if not path.is_absolute():
-        path = repo / path
-    if path.is_symlink():
-        raise SettingsError(f"Configuration path cannot be a symlink: {path}")
+    path = resolve_settings_path(repo, config_path)
     if not path.exists():
+        if config_path is not None:
+            raise SettingsError(f"Explicit configuration does not exist: {path}")
         return EvalynSettings(repo_path=repo)
+    operator_config = not path.is_relative_to(repo)
 
     try:
-        payload = RunStore.read_bytes(path, max_bytes=_MAX_CONFIG_BYTES)
+        payload = RunStore.read_bytes(path, max_bytes=MAX_CONFIG_BYTES)
         raw = yaml.safe_load(payload.decode("utf-8")) or {}
     except (OSError, UnicodeDecodeError, ValueError, yaml.YAMLError) as exc:
         raise SettingsError(f"Could not read {path}: {exc}") from exc
@@ -76,20 +101,40 @@ def load_settings(repo_path: Path, config_path: Path | None = None) -> EvalynSet
     unknown = set(raw) - {"version", "provider", "adapters", "sandbox", "limits"}
     if unknown:
         raise SettingsError(f"Unknown configuration keys: {', '.join(sorted(unknown))}")
-    if raw.get("version", 1) != 1:
+    version = raw.get("version", 1)
+    if not isinstance(version, int) or isinstance(version, bool) or version != 1:
         raise SettingsError("Only .evalyn.yml schema version 1 is supported")
 
-    provider = _provider_settings(raw.get("provider", {}))
+    provider = _provider_settings(
+        raw.get("provider", {}),
+        allow_custom_endpoint=operator_config,
+    )
     adapters = _adapter_settings(raw.get("adapters", []))
-    sandbox = _sandbox_settings(raw.get("sandbox", {}))
+    sandbox = _sandbox_settings(
+        raw.get("sandbox", {}),
+        allow_setup_environment=operator_config,
+    )
     limits = _mapping(raw.get("limits", {}), "limits")
-    max_tests = _positive_int(limits.get("max_tests", 12), "limits.max_tests")
-    repeat = _positive_int(limits.get("repeat", 3), "limits.repeat")
+    unknown_limits = set(limits) - {"max_tests", "repeat", "budget_seconds"}
+    if unknown_limits:
+        raise SettingsError(f"Unknown limits keys: {', '.join(sorted(unknown_limits))}")
+    max_tests = _positive_int(
+        limits.get("max_tests", 12),
+        "limits.max_tests",
+        maximum=MAX_TESTS,
+    )
+    repeat = _positive_int(
+        limits.get("repeat", 3),
+        "limits.repeat",
+        maximum=MAX_REPEAT,
+    )
     if repeat < 2:
         raise SettingsError("limits.repeat must be at least 2")
-    if repeat > 10:
-        raise SettingsError("limits.repeat must be at most 10")
-    budget_seconds = _positive_int(limits.get("budget_seconds", 600), "limits.budget_seconds")
+    budget_seconds = _positive_int(
+        limits.get("budget_seconds", 600),
+        "limits.budget_seconds",
+        maximum=MAX_BUDGET_SECONDS,
+    )
     return EvalynSettings(
         repo_path=repo,
         provider=provider,
@@ -99,6 +144,15 @@ def load_settings(repo_path: Path, config_path: Path | None = None) -> EvalynSet
         repeat=repeat,
         budget_seconds=budget_seconds,
     )
+
+
+def _reject_linked_config_path(path: Path) -> None:
+    for component in (path, *path.parents):
+        if component.is_symlink():
+            raise SettingsError(f"Configuration path cannot contain a symlink: {path}")
+        is_junction = getattr(component, "is_junction", lambda: False)
+        if is_junction():
+            raise SettingsError(f"Configuration path cannot contain a junction: {path}")
 
 
 def render_default_config(adapters: list[str]) -> str:
@@ -130,19 +184,32 @@ def render_default_config(adapters: list[str]) -> str:
     return "\n".join(lines)
 
 
-def _provider_settings(value: Any) -> ProviderSettings:
+def _provider_settings(value: Any, *, allow_custom_endpoint: bool) -> ProviderSettings:
     raw = _mapping(value, "provider")
     unknown = set(raw) - {"kind", "model", "base_url"}
     if unknown:
         raise SettingsError(f"Unknown provider keys: {', '.join(sorted(unknown))}")
-    kind = str(raw.get("kind", "anthropic"))
+    kind = raw.get("kind", "anthropic")
+    if not isinstance(kind, str):
+        raise SettingsError("provider.kind must be a string")
     if kind not in {"anthropic", "openai-compatible"}:
         raise SettingsError("provider.kind must be anthropic or openai-compatible")
     default_model = "claude-sonnet-4-20250514" if kind == "anthropic" else "gpt-4.1-mini"
+    model = raw.get("model", default_model)
+    if not isinstance(model, str) or not model.strip() or len(model) > 256:
+        raise SettingsError("provider.model must be a nonempty string of at most 256 characters")
+    base_url = raw.get("base_url")
+    if base_url is not None and (not isinstance(base_url, str) or not base_url.strip()):
+        raise SettingsError("provider.base_url must be a nonempty string")
+    if base_url is not None and not allow_custom_endpoint:
+        raise SettingsError(
+            "provider.base_url is operator policy and requires an explicit "
+            "configuration outside the repository"
+        )
     return ProviderSettings(
         kind=kind,
-        model=str(raw.get("model", default_model)),
-        base_url=str(raw["base_url"]) if raw.get("base_url") else None,
+        model=model,
+        base_url=base_url,
     )
 
 
@@ -158,7 +225,9 @@ def _adapter_settings(value: Any) -> tuple[AdapterSettings, ...]:
         unknown = set(raw) - {"name", "image", "setup_argv", "suite_argv"}
         if unknown:
             raise SettingsError(f"Unknown adapters[{index}] keys: {', '.join(sorted(unknown))}")
-        name = str(raw.get("name", ""))
+        name = raw.get("name", "")
+        if not isinstance(name, str):
+            raise SettingsError(f"adapters[{index}].name must be a string")
         if name not in {"pytest", "vitest"}:
             raise SettingsError(f"adapters[{index}].name must be pytest or vitest")
         if name in seen:
@@ -175,12 +244,14 @@ def _adapter_settings(value: Any) -> tuple[AdapterSettings, ...]:
     return tuple(result)
 
 
-def _sandbox_settings(value: Any) -> SandboxSettings:
+def _sandbox_settings(value: Any, *, allow_setup_environment: bool) -> SandboxSettings:
     raw = _mapping(value, "sandbox")
     unknown = set(raw) - {"runtime", "setup_env"}
     if unknown:
         raise SettingsError(f"Unknown sandbox keys: {', '.join(sorted(unknown))}")
-    runtime = str(raw.get("runtime", "auto"))
+    runtime = raw.get("runtime", "auto")
+    if not isinstance(runtime, str):
+        raise SettingsError("sandbox.runtime must be a string")
     if runtime not in {"auto", "docker", "podman"}:
         raise SettingsError("sandbox.runtime must be auto, docker, or podman")
     setup_env = _argv(raw.get("setup_env", []), "sandbox.setup_env")
@@ -192,6 +263,11 @@ def _sandbox_settings(value: Any) -> SandboxSettings:
                 "sandbox.setup_env only accepts package-registry variables; "
                 f"unsupported name: {name!r}"
             )
+    if setup_env and not allow_setup_environment:
+        raise SettingsError(
+            "sandbox.setup_env forwards operator secrets and requires an explicit "
+            "configuration outside the repository"
+        )
     return SandboxSettings(runtime=runtime, setup_env=setup_env)
 
 
@@ -244,13 +320,10 @@ def _container_image(value: Any, label: str) -> str | None:
     return image
 
 
-def _positive_int(value: Any, label: str) -> int:
-    if isinstance(value, bool):
+def _positive_int(value: Any, label: str, *, maximum: int | None = None) -> int:
+    """Validate an actual YAML integer without accepting coercible values."""
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
         raise SettingsError(f"{label} must be a positive integer")
-    try:
-        result = int(value)
-    except (TypeError, ValueError) as exc:
-        raise SettingsError(f"{label} must be a positive integer") from exc
-    if result <= 0:
-        raise SettingsError(f"{label} must be a positive integer")
-    return result
+    if maximum is not None and value > maximum:
+        raise SettingsError(f"{label} must be at most {maximum}")
+    return value

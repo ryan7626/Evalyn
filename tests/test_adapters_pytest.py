@@ -45,6 +45,8 @@ def test_builds_adapter_owned_path_and_argv():
         "--maxfail=1",
         "-p",
         "no:cacheprovider",
+        "-p",
+        "evalyn_pytest_reporter",
         artifact.relative_path.as_posix(),
     )
     assert artifact.source not in artifact.command

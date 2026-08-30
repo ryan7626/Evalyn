@@ -76,6 +76,65 @@ def test_check_dry_run_needs_no_key_or_container(tmp_path: Path) -> None:
     assert payload["changed_files"] == ["value.py"]
 
 
+def test_dry_run_honors_markdown_output_file(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    git(repo, "checkout", "-b", "feature")
+    (repo / "value.py").write_text("VALUE = 2\n")
+    git(repo, "commit", "-am", "change")
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "--repo",
+            str(repo),
+            "check",
+            "main...HEAD",
+            "--dry-run",
+            "--format",
+            "markdown",
+            "--output",
+            "artifacts/dry-run.md",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    output = repo / "artifacts" / "dry-run.md"
+    assert output.read_text(encoding="utf-8").startswith("# Evalyn dry run\n")
+    assert "`value.py`" in output.read_text(encoding="utf-8")
+
+
+def test_doctor_keeps_checks_independent_after_git_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = repository(tmp_path)
+    observed: list[str | None] = []
+    monkeypatch.setattr(
+        cli_module,
+        "validate_git_repository",
+        lambda _repo: (_ for _ in ()).throw(RuntimeError("broken git")),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "resolve_container_engine",
+        lambda preferred: observed.append(preferred) or "/usr/bin/docker",
+    )
+
+    result = CliRunner().invoke(
+        main,
+        ["--repo", str(repo), "doctor", "--format", "json"],
+    )
+
+    assert result.exit_code == 3
+    payload = json.loads(result.output)
+    checks = {item["name"]: item for item in payload["checks"]}
+    assert checks["git"]["status"] == "error"
+    assert checks["config"]["status"] == "ok"
+    assert checks["adapters"]["status"] == "ok"
+    assert checks["container"]["status"] == "ok"
+    assert checks["provider"]["status"] == "not_checked"
+    assert observed == [None]
+
+
 def test_dirty_dry_run_requires_explicit_opt_in(tmp_path: Path) -> None:
     repo = repository(tmp_path)
     (repo / "value.py").write_text("VALUE = 2\n")
@@ -183,12 +242,32 @@ def test_incomplete_check_exit_wins_over_finding_exit(
     assert result.exit_code == 3
 
 
+def test_stored_finding_sarif_is_a_real_sarif_log() -> None:
+    payload = cli_module._stored_finding_sarif(
+        {
+            "finding_id": "EVL-1234ABCD",
+            "title": "behavior changed",
+            "should_gate": False,
+            "semantic_state": "uncertain_change",
+            "triage_status": "unreviewed",
+            "probe_metadata": {"changed_file": "src/value.py"},
+        }
+    )
+
+    assert payload["version"] == "2.1.0"
+    result = payload["runs"][0]["results"][0]
+    assert result["ruleId"] == "evalyn/behavior-change"
+    assert result["locations"][0]["physicalLocation"]["artifactLocation"]["uri"] == "src/value.py"
+
+
 @pytest.mark.parametrize(
     "command",
     (
         ("show", "EVL-../../.."),
         ("reproduce", "EVL-../../.."),
         ("triage", "EVL-../../..", "--confirm", "--reason", "unsafe"),
+        ("bundle", "EVL-../../..", "--output", "finding.zip"),
+        ("promote", "EVL-../../..", "--output", "tests/test_probe.py"),
         ("repair", "EVL-../../..", "--emit-patch", "repair.patch"),
     ),
 )

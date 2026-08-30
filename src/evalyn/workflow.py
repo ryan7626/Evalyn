@@ -3,22 +3,28 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import stat
 import subprocess
 import time
+import uuid
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass, replace
 from math import ceil
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Protocol
 
-from evalyn.adapters.base import TestAdapter
+from evalyn.adapters.base import ProbeArtifact, TestAdapter
 from evalyn.adapters.registry import default_registry
+from evalyn.analysis import build_change_graph
+from evalyn.engine.assessment import apply_semantic_assessment
 from evalyn.engine.classifier import DifferentialClassifier
 from evalyn.engine.models import (
     DifferentialRunResult,
     ExecutionStatus,
     Revision,
+    RunVerdict,
 )
 from evalyn.engine.orchestrator import DifferentialEngine, ProbeExecutor
 from evalyn.engine.rules import IntentOracleAssessor
@@ -30,10 +36,20 @@ from evalyn.execution import (
 )
 from evalyn.execution.bounded import BoundedProcessResult, run_bounded_process
 from evalyn.execution.git_safety import sanitized_git_command, sanitized_git_environment
-from evalyn.generation import GenerationRequest, RepositoryContextSource, generate_probes
+from evalyn.generation import (
+    GenerationRequest,
+    ProbeInfrastructureError,
+    ProbeValidationError,
+    RepositoryContextSource,
+    generate_probe_portfolio,
+)
 from evalyn.llm import create_provider
 from evalyn.llm.base import BaseLLM
-from evalyn.probe_executor import DEFAULT_IMAGES, ContainerProbeExecutor
+from evalyn.probe_executor import (
+    DEFAULT_IMAGES,
+    ContainerProbeExecutor,
+    ProbeCollectionError,
+)
 from evalyn.reporting_v2 import write_reports
 from evalyn.revisions import (
     RevisionRange,
@@ -43,7 +59,14 @@ from evalyn.revisions import (
     validate_git_repository,
 )
 from evalyn.run_store import RunStore, StoredRun
-from evalyn.settings import AdapterSettings, EvalynSettings, ProviderSettings, load_settings
+from evalyn.settings import (
+    MAX_CONFIG_BYTES,
+    AdapterSettings,
+    EvalynSettings,
+    ProviderSettings,
+    load_settings,
+    resolve_settings_path,
+)
 
 _DIFF_CHAR_LIMIT = 120_000
 _DIFF_CAPTURE_LIMIT = (_DIFF_CHAR_LIMIT * 4) + 1
@@ -78,6 +101,7 @@ class CheckOptions:
     model: str | None = None
     config_path: Path | None = None
     state_root: Path | None = None
+    allow_remote_container: bool = False
 
 
 @dataclass(frozen=True)
@@ -107,12 +131,20 @@ class CheckOutcome:
 
     @property
     def incomplete(self) -> bool:
-        return any(
-            record.result.status in {ExecutionStatus.INFRA_ERROR, ExecutionStatus.INVALID_PROBE}
-            for result in self.results
-            for assessment in result.assessments
-            for record in (*assessment.base_runs, *assessment.candidate_runs)
-        )
+        return self.verdict in {RunVerdict.INCOMPLETE, RunVerdict.INSUFFICIENT_EVIDENCE}
+
+    @property
+    def verdict(self) -> RunVerdict:
+        verdicts = {result.verdict for result in self.results}
+        if RunVerdict.INCOMPLETE in verdicts:
+            return RunVerdict.INCOMPLETE
+        if RunVerdict.REGRESSION_FOUND in verdicts:
+            return RunVerdict.REGRESSION_FOUND
+        if RunVerdict.CHANGE_OBSERVED in verdicts:
+            return RunVerdict.CHANGE_OBSERVED
+        if verdicts and verdicts == {RunVerdict.NO_DIFFERENTIAL_OBSERVED}:
+            return RunVerdict.NO_DIFFERENTIAL_OBSERVED
+        return RunVerdict.INSUFFICIENT_EVIDENCE
 
 
 class PreparedProbeExecutor(ProbeExecutor, Protocol):
@@ -129,7 +161,6 @@ ExecutorFactory = Callable[
 
 def inspect_check(options: CheckOptions) -> CheckInspection:
     repo = validate_git_repository(options.repo_path)
-    settings = load_settings(repo, options.config_path)
     dirty = is_dirty(repo)
     if dirty and not options.include_dirty:
         raise CheckError(
@@ -137,6 +168,12 @@ def inspect_check(options: CheckOptions) -> CheckInspection:
             "--include-dirty to snapshot them explicitly"
         )
     revisions = resolve_range(repo, options.range_spec, allow_same=options.include_dirty)
+    trusted_config_path = _require_trusted_configuration(repo, revisions, options.config_path)
+    settings = (
+        load_settings(repo, trusted_config_path)
+        if trusted_config_path is not None
+        else EvalynSettings(repo_path=repo)
+    )
     registry = default_registry()
     names = options.adapters or tuple(item.name for item in settings.adapters)
     if not names:
@@ -186,6 +223,7 @@ def run_check(
     candidate_id = inspection.revisions.candidate_sha
     overlay_metadata: dict[str, object] = {"present": False}
     recorded_runtime = settings.sandbox.runtime
+    environments: dict[str, dict[str, object]] = {}
 
     try:
         with (
@@ -205,6 +243,19 @@ def run_check(
                 overlay_metadata = _persist_dirty_overlay(run.path, worktrees)
             diff = _workspace_diff(worktrees, inspection.changed_files)
             context_sources = _collect_context(worktrees, inspection.changed_files)
+            repository_paths = tuple(
+                sorted(
+                    set(worktrees.tracked_files("baseline"))
+                    | set(worktrees.tracked_files("candidate"))
+                )
+            )
+            change_graph = build_change_graph(
+                worktrees.baseline_path,
+                worktrees.candidate_path,
+                changed_paths=inspection.changed_files,
+                diff=diff,
+                repository_paths=repository_paths,
+            )
             registry = default_registry()
             base_revision = Revision(worktrees.baseline_sha, worktrees.baseline_path)
             candidate_revision = Revision(candidate_id, worktrees.candidate_path)
@@ -228,6 +279,7 @@ def run_check(
                         runtime,
                         remaining_budget,
                         setup_env_names=settings.sandbox.setup_env,
+                        allow_remote_endpoint=options.allow_remote_container,
                     )
                 else:
                     executor = executor_factory(
@@ -243,6 +295,11 @@ def run_check(
                         f"{path.name}: {message}" for path, message in executor.setup_errors.items()
                     )
                     raise CheckError(f"{name} dependency setup failed: {detail}")
+                fingerprint = getattr(executor, "environment_fingerprint", None)
+                if isinstance(fingerprint, dict):
+                    environments[name] = fingerprint
+                elif executor_factory is None:
+                    raise CheckError(f"{name} execution environment identity is unavailable")
                 generation_budget = settings.budget_seconds - (time.monotonic() - started)
                 if generation_budget <= 0:
                     raise CheckError("Check execution budget was exhausted before generation")
@@ -250,7 +307,7 @@ def run_check(
                     settings.provider,
                     timeout_seconds=min(120, generation_budget),
                 )
-                probes = generate_probes(
+                portfolio = generate_probe_portfolio(
                     provider,
                     GenerationRequest(
                         adapter=name,
@@ -258,20 +315,45 @@ def run_check(
                         context_sources=context_sources,
                         intent=options.intent,
                         max_tests=settings.max_tests,
+                        change_graph=change_graph,
                     ),
+                    preflight=_collection_preflight(executor, name, base_revision),
                 )
+                RunStore.write_json(
+                    run.path / "analysis" / f"{name}.json",
+                    {
+                        "schema_version": 1,
+                        "adapter": name,
+                        "change_graph": change_graph.to_dict(),
+                        "portfolio": portfolio.to_dict(),
+                    },
+                )
+                if portfolio.infrastructure_error_count:
+                    raise CheckError(
+                        f"{name} provider infrastructure failed during portfolio generation"
+                    )
+                if not portfolio.probes:
+                    raise CheckError(f"{name} produced no valid probes after bounded correction")
                 engine = DifferentialEngine(
                     adapter,
                     executor,
                     classifier=DifferentialClassifier(settings.repeat),
                     assessor=IntentOracleAssessor(options.intent),
                 )
+                evaluated = engine.evaluate(
+                    base_revision,
+                    candidate_revision,
+                    portfolio.probes,
+                    run_id=run.run_id,
+                )
                 results.append(
-                    engine.evaluate(
-                        base_revision,
-                        candidate_revision,
-                        probes,
-                        run_id=run.run_id,
+                    _verify_target_interventions(
+                        evaluated,
+                        adapter=adapter,
+                        executor=executor,
+                        base_revision=base_revision,
+                        candidate_revision=candidate_revision,
+                        assessor=IntentOracleAssessor(options.intent),
                     )
                 )
 
@@ -280,11 +362,13 @@ def run_check(
                 "base_sha": worktrees.baseline_sha,
                 "candidate_sha": candidate_id,
                 "intent": options.intent,
+                "environments": environments,
             }
             report_paths = write_reports(run.path, results, metadata=metadata)
 
         duration = time.monotonic() - started
-        incomplete = _has_incomplete_evidence(results)
+        verdict = _aggregate_result_verdict(results)
+        incomplete = verdict in {RunVerdict.INCOMPLETE, RunVerdict.INSUFFICIENT_EVIDENCE}
         status = "incomplete" if incomplete else "complete"
         run = store.finish_run(
             run,
@@ -295,11 +379,15 @@ def run_check(
                 "finding_count": sum(len(result.findings) for result in results),
                 "gating_finding_count": sum(len(result.gating_findings) for result in results),
                 "duration_seconds": round(duration, 3),
+                "verdict": verdict.value,
                 "dirty_overlay": overlay_metadata,
+                "environments": environments,
                 "configuration": _settings_snapshot(
                     settings,
                     inspection.adapters,
                     runtime=recorded_runtime,
+                    environments=environments,
+                    allow_remote_endpoint=options.allow_remote_container,
                 ),
             },
         )
@@ -352,7 +440,10 @@ def _settings_snapshot(
     adapter_names: tuple[str, ...],
     *,
     runtime: str | None = None,
+    environments: dict[str, dict[str, object]] | None = None,
+    allow_remote_endpoint: bool = False,
 ) -> dict[str, object]:
+    environment_values = environments or {}
     return {
         "provider": {
             "kind": settings.provider.kind,
@@ -361,13 +452,22 @@ def _settings_snapshot(
         "sandbox": {
             "runtime": runtime or settings.sandbox.runtime,
             "setup_env_names": list(settings.sandbox.setup_env),
+            "allow_remote_endpoint": allow_remote_endpoint,
         },
         "adapters": [
             {
                 "name": item.name,
                 "setup_argv": list(item.setup_argv),
                 "suite_argv": list(item.suite_argv),
-                "image": item.image or DEFAULT_IMAGES[item.name],
+                "image": (
+                    environment_values.get(item.name, {}).get("resolved_image_identity")
+                    or item.image
+                    or DEFAULT_IMAGES[item.name]
+                ),
+                "declared_image": item.image or DEFAULT_IMAGES[item.name],
+                "environment_fingerprint_sha256": environment_values.get(item.name, {}).get(
+                    "fingerprint_sha256"
+                ),
             }
             for item in (_adapter_settings(settings, name) for name in adapter_names)
         ],
@@ -387,6 +487,7 @@ def _container_executor_factory(
     budget_seconds: int,
     *,
     setup_env_names: tuple[str, ...] = (),
+    allow_remote_endpoint: bool = False,
 ) -> ContainerProbeExecutor:
     return ContainerProbeExecutor(
         adapter,
@@ -396,7 +497,188 @@ def _container_executor_factory(
         setup_argv=settings.setup_argv,
         setup_env_names=setup_env_names,
         timeout_seconds=budget_seconds,
+        allow_remote_endpoint=allow_remote_endpoint,
     )
+
+
+def _collection_preflight(
+    executor: PreparedProbeExecutor,
+    adapter_name: str,
+    base_revision: Revision,
+) -> Callable[[str, str], None] | None:
+    """Adapt an executor's collection check to portfolio validation."""
+    preflight_method = getattr(executor, "preflight", None)
+    if not callable(preflight_method):
+        return None
+
+    def validate(request_adapter: str, source: str) -> None:
+        if request_adapter != adapter_name:
+            return
+        try:
+            preflight_method(base_revision, source)
+        except ProbeCollectionError as exc:
+            if exc.code == "collection_failed":
+                raise ProbeValidationError(exc.code, exc.feedback) from exc
+            raise ProbeInfrastructureError(
+                f"Framework collection preflight infrastructure failed ({exc.code})."
+            ) from exc
+        except ProbeInfrastructureError:
+            raise
+        except Exception as exc:
+            raise ProbeInfrastructureError(
+                "Framework collection preflight infrastructure failed."
+            ) from exc
+
+    return validate
+
+
+_TARGET_INTERVENTION_FILE_LIMIT = 8 * 1024 * 1024
+
+
+class _TargetInterventionRestoreError(RuntimeError):
+    pass
+
+
+def _verify_target_interventions(
+    result: DifferentialRunResult,
+    *,
+    adapter: TestAdapter,
+    executor: PreparedProbeExecutor,
+    base_revision: Revision,
+    candidate_revision: Revision,
+    assessor: IntentOracleAssessor,
+) -> DifferentialRunResult:
+    """Re-run eligible probes after reverting only their claimed target file."""
+    updated = []
+    for finding in result.findings:
+        evidence = finding.evidence
+        if not (
+            evidence is not None
+            and evidence.environment_integrity
+            and evidence.target_binding_verified
+            and evidence.oracle_binding_verified
+        ):
+            updated.append(finding)
+            continue
+        artifact = adapter.build_artifact(finding.probe_source)
+        if artifact.probe_id != finding.artifact.probe_id:
+            updated.append(finding)
+            continue
+        state, repetitions = _run_target_revert_intervention(
+            executor,
+            artifact,
+            finding.probe_metadata,
+            base_revision,
+            candidate_revision,
+        )
+        metadata = dict(finding.probe_metadata)
+        metadata["target_intervention"] = state
+        metadata["target_intervention_repetitions"] = str(repetitions)
+        candidate = replace(
+            finding,
+            probe_metadata=metadata,
+            evidence=replace(
+                evidence,
+                target_intervention_verified=state == "candidate_target_revert_passed",
+                target_intervention_repetitions=repetitions,
+            ),
+        )
+        with suppress(Exception):
+            candidate = apply_semantic_assessment(candidate, assessor.assess(candidate))
+        updated.append(candidate)
+    return replace(result, findings=tuple(updated))
+
+
+def _run_target_revert_intervention(
+    executor: PreparedProbeExecutor,
+    artifact: ProbeArtifact,
+    metadata: object,
+    base_revision: Revision,
+    candidate_revision: Revision,
+) -> tuple[str, int]:
+    if not isinstance(metadata, dict) or metadata.get("change_kind") != "modified":
+        return "candidate_target_revert_unsupported", 0
+    base_relative = metadata.get("target_base_path") or metadata.get("changed_file")
+    candidate_relative = metadata.get("target_candidate_path") or metadata.get("changed_file")
+    if not isinstance(base_relative, str) or not isinstance(candidate_relative, str):
+        return "candidate_target_revert_unsupported", 0
+    try:
+        base_path = _contained_intervention_path(base_revision.workspace, base_relative)
+        candidate_path = _contained_intervention_path(
+            candidate_revision.workspace, candidate_relative
+        )
+        base_content, base_mode = _regular_target_snapshot(base_path)
+        candidate_content, candidate_mode = _regular_target_snapshot(candidate_path)
+        _atomic_replace_target(candidate_path, base_content, base_mode)
+        results = []
+        try:
+            results = [
+                executor.execute(candidate_revision, artifact, repetition=10_000 + index)
+                for index in range(1, 4)
+            ]
+        finally:
+            try:
+                _atomic_replace_target(candidate_path, candidate_content, candidate_mode)
+            except Exception as exc:
+                raise _TargetInterventionRestoreError(
+                    "candidate target could not be restored after intervention"
+                ) from exc
+        restored, restored_mode = _regular_target_snapshot(candidate_path)
+        if restored != candidate_content or restored_mode != candidate_mode:
+            raise _TargetInterventionRestoreError(
+                "candidate target bytes changed during intervention restoration"
+            )
+    except _TargetInterventionRestoreError as exc:
+        raise CheckError(str(exc)) from exc
+    except Exception:
+        return "candidate_target_revert_incomplete", 0
+    if any(
+        item.status in {ExecutionStatus.INVALID_PROBE, ExecutionStatus.INFRA_ERROR}
+        for item in results
+    ):
+        return "candidate_target_revert_incomplete", len(results)
+    if len(results) == 3 and all(item.status == ExecutionStatus.PASSED for item in results):
+        return "candidate_target_revert_passed", 3
+    return "candidate_target_revert_did_not_recover", len(results)
+
+
+def _contained_intervention_path(root: Path, raw_relative: str) -> Path:
+    relative = PurePosixPath(raw_relative)
+    if (
+        relative.is_absolute()
+        or not relative.parts
+        or any(part in {"", ".", ".."} for part in relative.parts)
+        or "\\" in raw_relative
+    ):
+        raise ValueError("unsafe target intervention path")
+    workspace = root.resolve(strict=True)
+    target = workspace.joinpath(*relative.parts)
+    if target.resolve(strict=True) != target or not target.is_relative_to(workspace):
+        raise ValueError("target intervention path crosses a symlink")
+    return target
+
+
+def _regular_target_snapshot(path: Path) -> tuple[bytes, int]:
+    metadata = path.lstat()
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or metadata.st_size > _TARGET_INTERVENTION_FILE_LIMIT
+    ):
+        raise ValueError("target intervention requires one bounded regular file")
+    return (
+        RunStore.read_bytes(path, max_bytes=_TARGET_INTERVENTION_FILE_LIMIT),
+        metadata.st_mode & 0o777,
+    )
+
+
+def _atomic_replace_target(path: Path, content: bytes, mode: int) -> None:
+    temporary = path.parent / f".evalyn-intervention-{uuid.uuid4().hex}"
+    try:
+        RunStore.write_bytes(temporary, content, mode=mode)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _workspace_diff(worktrees: WorktreeSession, changed: tuple[str, ...]) -> str:
@@ -511,7 +793,7 @@ def _changed_paths_from_diff(
         "--no-ext-diff",
         "--no-textconv",
         "--name-only",
-        "--diff-filter=ACMRT",
+        "--diff-filter=ACDMRT",
         revisions.base_sha,
         revisions.candidate_sha,
         "--",
@@ -583,13 +865,118 @@ def _read_file_prefix(path: Path, max_bytes: int) -> tuple[bytes, bool]:
     return data[:max_bytes], len(data) > max_bytes
 
 
-def _has_incomplete_evidence(results: list[DifferentialRunResult]) -> bool:
-    return any(
-        record.result.status in {ExecutionStatus.INFRA_ERROR, ExecutionStatus.INVALID_PROBE}
-        for result in results
-        for assessment in result.assessments
-        for record in (*assessment.base_runs, *assessment.candidate_runs)
+def _require_trusted_configuration(
+    repo: Path,
+    revisions: RevisionRange,
+    config_path: Path | None,
+) -> Path | None:
+    """Return a trusted resolved config path, rejecting byte-level drift."""
+    resolved = resolve_settings_path(repo, config_path)
+    try:
+        relative = resolved.relative_to(repo).as_posix()
+    except ValueError:
+        # An explicit configuration outside the checkout is operator policy.
+        return resolved
+    if relative in {"", "."}:
+        raise CheckError("Repository configuration path must name one regular file")
+
+    base_payload = _configuration_blob_bytes(
+        repo,
+        revisions.base_sha,
+        relative,
+        label="selected base",
     )
+    candidate_payload = _configuration_blob_bytes(
+        repo,
+        revisions.candidate_sha,
+        relative,
+        label="selected candidate",
+    )
+    working_payload = _working_configuration_bytes(resolved, relative)
+    if base_payload != candidate_payload or base_payload != working_payload:
+        raise CheckError(
+            f"Repository configuration {relative!r} differs from the selected base; "
+            "review it and pass an explicit --config outside the repository"
+        )
+    if working_payload is None and config_path is None:
+        return None
+    return resolved
+
+
+def _configuration_blob_bytes(
+    repo: Path,
+    revision: str,
+    relative: str,
+    *,
+    label: str,
+) -> bytes | None:
+    encoded_relative = os.fsencode(relative)
+    pathspec = f":(top,literal){relative}"
+    tree = _run_host_git(
+        sanitized_git_command(
+            repo,
+            "ls-tree",
+            "-z",
+            "--full-tree",
+            revision,
+            "--",
+            pathspec,
+        ),
+        max_stdout_bytes=min(_GIT_METADATA_LIMIT, len(encoded_relative) + 512),
+        description=f"{label} configuration identity",
+    )
+    if not tree.stdout:
+        return None
+    if not tree.stdout.endswith(b"\0"):
+        raise CheckError(f"Could not verify {label} configuration: malformed Git tree output")
+    records = tree.stdout[:-1].split(b"\0")
+    if len(records) != 1:
+        raise CheckError(f"Could not verify {label} configuration: ambiguous Git tree output")
+    metadata, separator, observed_path = records[0].partition(b"\t")
+    fields = metadata.split()
+    if separator != b"\t" or len(fields) != 3 or observed_path != encoded_relative:
+        raise CheckError(f"Could not verify {label} configuration: malformed Git tree entry")
+    mode, object_type, object_id = fields
+    if object_type != b"blob" or mode not in {b"100644", b"100755"}:
+        raise CheckError(f"Repository configuration {relative!r} is not a regular {label} blob")
+    if len(object_id) not in {40, 64} or any(byte not in b"0123456789abcdef" for byte in object_id):
+        raise CheckError(f"Could not verify {label} configuration: malformed blob identity")
+    blob = _run_host_git(
+        sanitized_git_command(repo, "cat-file", "blob", object_id.decode("ascii")),
+        max_stdout_bytes=MAX_CONFIG_BYTES,
+        description=f"{label} configuration blob",
+    )
+    return blob.stdout
+
+
+def _working_configuration_bytes(path: Path, relative: str) -> bytes | None:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise CheckError(f"Could not inspect repository configuration {relative!r}: {exc}") from exc
+    if not stat.S_ISREG(metadata.st_mode):
+        raise CheckError(f"Repository configuration {relative!r} is not one regular file")
+    try:
+        return RunStore.read_bytes(path, max_bytes=MAX_CONFIG_BYTES)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        raise CheckError(f"Could not read repository configuration {relative!r}: {exc}") from exc
+
+
+def _aggregate_result_verdict(results: list[DifferentialRunResult]) -> RunVerdict:
+    verdicts = {result.verdict for result in results}
+    if RunVerdict.INCOMPLETE in verdicts:
+        return RunVerdict.INCOMPLETE
+    if RunVerdict.REGRESSION_FOUND in verdicts:
+        return RunVerdict.REGRESSION_FOUND
+    if RunVerdict.CHANGE_OBSERVED in verdicts:
+        return RunVerdict.CHANGE_OBSERVED
+    if verdicts and verdicts == {RunVerdict.NO_DIFFERENTIAL_OBSERVED}:
+        return RunVerdict.NO_DIFFERENTIAL_OBSERVED
+    return RunVerdict.INSUFFICIENT_EVIDENCE
 
 
 def _persist_dirty_overlay(run_path: Path, worktrees: WorktreeSession) -> dict[str, object]:

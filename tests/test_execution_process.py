@@ -113,6 +113,7 @@ class TestSanitizedEnvironment:
             "SSH_AUTH_SOCK",
             "EVALYN_TEST_PORT",
             "GIT_CONFIG_GLOBAL",
+            "GIT_NO_REPLACE_OBJECTS",
         ]
         script = (
             "import json, os, sys; "
@@ -134,6 +135,7 @@ class TestSanitizedEnvironment:
         assert child_env["SSH_AUTH_SOCK"] is None
         assert child_env["EVALYN_TEST_PORT"] == "4123"
         assert child_env["GIT_CONFIG_GLOBAL"] == os.devnull
+        assert child_env["GIT_NO_REPLACE_OBJECTS"] == "1"
 
     @pytest.mark.parametrize(
         "name",

@@ -13,6 +13,12 @@ from pathlib import Path
 
 from evalyn.execution.bounded import run_bounded_process
 from evalyn.execution.errors import RuntimeUnavailableError
+from evalyn.execution.image_identity import (
+    EnvironmentFingerprint,
+    ImageIdentityError,
+    ImageIdentityResolution,
+    parse_image_identity_inspection,
+)
 from evalyn.execution.process import CommandResult, CommandRunner
 from evalyn.execution.runtime import OciContainerRuntime, RuntimeInvocation
 
@@ -52,10 +58,20 @@ class ContainerRunner:
         cleanup_timeout_seconds: float = 15.0,
         allowed_secret_env_names: Sequence[str] = (),
         workspace_read_only: bool = False,
+        allow_remote_endpoint: bool = False,
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve()
         self.engine = resolve_container_engine(engine)
-        self._client_env = _resolve_container_client_environment(engine, self.engine)
+        self._client_env = _resolve_container_client_environment(
+            engine,
+            self.engine,
+            allow_remote_endpoint=allow_remote_endpoint,
+        )
+        self._endpoint_scope = (
+            "remote"
+            if any(value.startswith(("tcp://", "ssh://")) for value in self._client_env.values())
+            else "local"
+        )
         self.runtime = OciContainerRuntime(
             image,
             engine=self.engine,
@@ -79,6 +95,9 @@ class ContainerRunner:
             termination_grace_seconds=termination_grace_seconds,
         )
         self.last_invocation: RuntimeInvocation | None = None
+        self.environment_fingerprint = self._environment_fingerprint()
+        self._successful_run_generation = 0
+        self._fingerprint_generation = -1
 
     def run(
         self,
@@ -125,15 +144,68 @@ class ContainerRunner:
 
             assert result is not None
             if cleanup_error is None:
-                return result
-            error = cleanup_error if result.error is None else f"{result.error}; {cleanup_error}"
-            return replace(result, error=error)
+                final_result = result
+            else:
+                error = (
+                    cleanup_error if result.error is None else f"{result.error}; {cleanup_error}"
+                )
+                final_result = replace(result, error=error)
+            if final_result.succeeded:
+                self._successful_run_generation += 1
+                self._fingerprint_generation = -1
+                self.environment_fingerprint = self._environment_fingerprint()
+            return final_result
         finally:
             if secret_file is not None:
                 secret_file.unlink(missing_ok=True)
 
     def close(self) -> None:
         self._client.close()
+
+    def resolve_environment_fingerprint(self) -> EnvironmentFingerprint:
+        """Resolve and cache the image ID after a successful OCI workload.
+
+        Inspection uses the same sanitized client and trusted local endpoint as
+        the workload. A failed, timed-out, truncated, or malformed inspection
+        produces an incomplete fingerprint with a stable error code.
+        """
+        if self._successful_run_generation == 0:
+            resolution = ImageIdentityResolution.incomplete(ImageIdentityError.NO_SUCCESSFUL_LAUNCH)
+            self.environment_fingerprint = self._environment_fingerprint(resolution)
+            return self.environment_fingerprint
+        if (
+            self._fingerprint_generation == self._successful_run_generation
+            and self.environment_fingerprint.complete
+        ):
+            return self.environment_fingerprint
+
+        inspection = self._client.run(
+            [
+                self.engine,
+                "image",
+                "inspect",
+                "--format",
+                "{{.Id}}",
+                self.image,
+            ],
+            cwd=self.workspace_root,
+            timeout_seconds=self.cleanup_timeout_seconds,
+            env=self._client_env,
+        )
+        resolution = parse_image_identity_inspection(inspection)
+        self.environment_fingerprint = self._environment_fingerprint(resolution)
+        if self.environment_fingerprint.complete:
+            self._fingerprint_generation = self._successful_run_generation
+        return self.environment_fingerprint
+
+    def _environment_fingerprint(
+        self,
+        resolution: ImageIdentityResolution | None = None,
+    ) -> EnvironmentFingerprint:
+        return replace(
+            self.runtime.environment_fingerprint(resolution),
+            endpoint_scope=self._endpoint_scope,
+        )
 
     def __enter__(self) -> ContainerRunner:
         return self
@@ -210,6 +282,8 @@ def resolve_container_engine(preferred: str | None = None) -> str:
 def _resolve_container_client_environment(
     requested_engine: str | None,
     resolved_engine: str,
+    *,
+    allow_remote_endpoint: bool = False,
 ) -> dict[str, str]:
     """Preserve only the local daemon endpoint, never the user's registry auth.
 
@@ -223,7 +297,12 @@ def _resolve_container_client_environment(
     if name == "docker":
         explicit = os.environ.get("DOCKER_HOST")
         if explicit:
-            return {"DOCKER_HOST": _validate_container_endpoint(explicit)}
+            return {
+                "DOCKER_HOST": _validate_container_endpoint(
+                    explicit,
+                    allow_remote=allow_remote_endpoint,
+                )
+            }
         if requested_engine not in {None, "docker"}:
             return {}
         discovery_env = {
@@ -250,24 +329,31 @@ def _resolve_container_client_environment(
         if completed.returncode != 0 or completed.stdout_truncated or completed.stderr_truncated:
             return {}
         try:
-            endpoint = _validate_container_endpoint(
-                completed.stdout.decode("utf-8", errors="strict").strip()
-            )
-        except (UnicodeDecodeError, ValueError):
+            raw_endpoint = completed.stdout.decode("utf-8", errors="strict").strip()
+        except UnicodeDecodeError:
             return {}
+        endpoint = _validate_container_endpoint(
+            raw_endpoint,
+            allow_remote=allow_remote_endpoint,
+        )
         return {"DOCKER_HOST": endpoint}
 
     if name == "podman":
         result: dict[str, str] = {}
-        for key in ("CONTAINER_HOST", "XDG_RUNTIME_DIR"):
-            value = os.environ.get(key)
-            if value and "\x00" not in value and "\n" not in value:
-                result[key] = value
+        explicit = os.environ.get("CONTAINER_HOST")
+        if explicit:
+            result["CONTAINER_HOST"] = _validate_container_endpoint(
+                explicit,
+                allow_remote=allow_remote_endpoint,
+            )
+        runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
+        if runtime_dir and "\x00" not in runtime_dir and "\n" not in runtime_dir:
+            result["XDG_RUNTIME_DIR"] = runtime_dir
         return result
     return {}
 
 
-def _validate_container_endpoint(value: str) -> str:
+def _validate_container_endpoint(value: str, *, allow_remote: bool = False) -> str:
     endpoint = value.strip()
     if (
         not endpoint
@@ -277,6 +363,10 @@ def _validate_container_endpoint(value: str) -> str:
         or not endpoint.startswith(("unix://", "npipe://", "tcp://", "ssh://"))
     ):
         raise ValueError("Container endpoint must be a supported structured URI")
+    if endpoint.startswith(("tcp://", "ssh://")) and not allow_remote:
+        raise ValueError(
+            "Remote container endpoints are disabled; explicit operator opt-in is required"
+        )
     return endpoint
 
 

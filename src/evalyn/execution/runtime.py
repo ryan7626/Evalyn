@@ -12,6 +12,13 @@ from pathlib import Path
 from typing import Protocol
 
 from evalyn.execution.errors import RuntimeUnavailableError
+from evalyn.execution.image_identity import (
+    EnvironmentFingerprint,
+    ImageIdentityError,
+    ImageIdentityResolution,
+    SecurityPolicy,
+    normalized_engine_name,
+)
 from evalyn.execution.process import validate_environment_overrides
 
 
@@ -128,6 +135,40 @@ class OciContainerRuntime:
             raise RuntimeUnavailableError(
                 f"Container runtime executable is unavailable: {self.engine}"
             )
+
+    def environment_fingerprint(
+        self,
+        image_resolution: ImageIdentityResolution | None = None,
+    ) -> EnvironmentFingerprint:
+        """Describe the immutable image resolution and declared OCI policy.
+
+        The executable path and daemon endpoint are intentionally normalized
+        away so this value is safe to persist in evidence artifacts.
+        """
+        resolution = image_resolution or ImageIdentityResolution.incomplete(
+            ImageIdentityError.NOT_INSPECTED
+        )
+        return EnvironmentFingerprint(
+            engine=normalized_engine_name(self.engine),
+            declared_image=self.image,
+            image_resolution=resolution,
+            endpoint_scope="local",
+            network_policy=self.network,
+            root_filesystem_read_only=self.read_only_root,
+            workspace_read_only=self.workspace_read_only,
+            pull_policy=self.pull_policy,
+            security_policy=SecurityPolicy(
+                capabilities_dropped=("ALL",),
+                no_new_privileges=True,
+                pids_limit=self.pids_limit,
+                memory_limit=self.memory,
+                cpu_limit=self.cpus,
+                run_as_current_user=(
+                    self.run_as_current_user and hasattr(os, "getuid") and hasattr(os, "getgid")
+                ),
+                tmpfs_size=self.tmpfs_size,
+            ),
+        )
 
     def prepare(
         self,

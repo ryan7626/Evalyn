@@ -53,7 +53,7 @@ def test_builds_adapter_owned_path_and_argv():
         "vitest",
         "run",
         artifact.relative_path.as_posix(),
-        "--reporter=verbose",
+        "--reporter=json",
         "--no-cache",
     )
     assert artifact.source not in artifact.command

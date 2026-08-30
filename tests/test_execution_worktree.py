@@ -75,6 +75,19 @@ def test_dual_worktrees_are_detached_and_source_checkout_is_untouched(
     assert _git(repo, "rev-parse", "HEAD") == candidate_sha
 
 
+def test_worktree_git_environment_disables_replacement_objects(
+    revision_repo: tuple[Path, str, str],
+) -> None:
+    repo, base_sha, candidate_sha = revision_repo
+    session = WorktreeSession(
+        repo,
+        baseline_revision=base_sha,
+        candidate_revision=candidate_sha,
+    )
+
+    assert session._git_environment()["GIT_NO_REPLACE_OBJECTS"] == "1"
+
+
 def test_dirty_overlay_is_candidate_only_and_survives_candidate_restore(
     revision_repo: tuple[Path, str, str],
     tmp_path: Path,

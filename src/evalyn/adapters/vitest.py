@@ -72,6 +72,6 @@ class VitestAdapter(TestAdapter):
             "vitest",
             "run",
             relative_path.as_posix(),
-            "--reporter=verbose",
+            "--reporter=json",
             "--no-cache",
         )

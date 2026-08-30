@@ -702,6 +702,7 @@ class WorktreeSession:
         return {
             "GIT_CONFIG_GLOBAL": os.devnull,
             "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_NO_REPLACE_OBJECTS": "1",
             "GIT_TERMINAL_PROMPT": "0",
             "HOME": str(home),
             "LANG": "C",

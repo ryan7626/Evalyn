@@ -14,6 +14,15 @@ from evalyn.execution.errors import (
     WorktreeCleanupError,
     WorktreeError,
 )
+from evalyn.execution.image_identity import (
+    EnvironmentFingerprint,
+    ImageIdentity,
+    ImageIdentityError,
+    ImageIdentityResolution,
+    ImageIdentityStatus,
+    SecurityPolicy,
+    parse_image_identity_inspection,
+)
 from evalyn.execution.lock import RepoRunLock, read_lock_metadata
 from evalyn.execution.paths import WorkspacePathPolicy
 from evalyn.execution.process import (
@@ -36,19 +45,26 @@ __all__ = [
     "DirtyOverlay",
     "ExecutionRuntime",
     "ExecutionSafetyError",
+    "EnvironmentFingerprint",
     "HostRuntime",
+    "ImageIdentity",
+    "ImageIdentityError",
+    "ImageIdentityResolution",
+    "ImageIdentityStatus",
     "OciContainerRuntime",
     "PathPolicyError",
     "RepoRunLock",
     "RunLockError",
     "RuntimeInvocation",
     "RuntimeUnavailableError",
+    "SecurityPolicy",
     "WorkspacePathPolicy",
     "WorktreeCleanupError",
     "WorktreeError",
     "WorktreePair",
     "WorktreeSession",
     "read_lock_metadata",
+    "parse_image_identity_inspection",
     "resolve_container_engine",
     "validate_environment_overrides",
 ]

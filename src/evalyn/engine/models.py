@@ -47,6 +47,16 @@ class TriageStatus(str, Enum):
     UNCERTAIN = "uncertain"
 
 
+class RunVerdict(str, Enum):
+    """High-level outcome without implying that an unobserved bug is absent."""
+
+    REGRESSION_FOUND = "regression_found"
+    CHANGE_OBSERVED = "change_observed"
+    NO_DIFFERENTIAL_OBSERVED = "no_differential_observed"
+    INSUFFICIENT_EVIDENCE = "insufficient_evidence"
+    INCOMPLETE = "incomplete"
+
+
 @dataclass(frozen=True)
 class Revision:
     """An immutable revision checked out in an executor-owned workspace."""
@@ -176,6 +186,63 @@ class ClassificationResult:
 
 
 @dataclass(frozen=True)
+class EvidenceVector:
+    """Independent evidence dimensions for a stable behavior change.
+
+    Evalyn deliberately does not collapse these dimensions into a model-authored
+    confidence score.  Gate policies can instead make auditable decisions from
+    causal repetition, oracle provenance, target binding, and environment state.
+    """
+
+    causal_transition: str
+    base_repetitions: int
+    candidate_repetitions: int
+    repeatable: bool
+    oracle_kind: str = "none"
+    oracle_source: str = ""
+    target_file: str = ""
+    target_symbol: str = ""
+    target_binding_verified: bool = False
+    oracle_binding_verified: bool = False
+    target_intervention_verified: bool = False
+    target_intervention_repetitions: int = 0
+    corroboration_count: int = 1
+    change_coverage: float | None = None
+    environment_integrity: bool = True
+
+    def __post_init__(self) -> None:
+        if self.base_repetitions < 1 or self.candidate_repetitions < 1:
+            raise ValueError("evidence repetitions must be positive")
+        if self.corroboration_count < 1:
+            raise ValueError("corroboration_count must be positive")
+        if self.target_intervention_repetitions < 0:
+            raise ValueError("target_intervention_repetitions cannot be negative")
+        if self.target_intervention_verified and self.target_intervention_repetitions < 3:
+            raise ValueError("verified target intervention requires three repetitions")
+        if self.change_coverage is not None and not 0 <= self.change_coverage <= 1:
+            raise ValueError("change_coverage must be between zero and one")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "causal_transition": self.causal_transition,
+            "base_repetitions": self.base_repetitions,
+            "candidate_repetitions": self.candidate_repetitions,
+            "repeatable": self.repeatable,
+            "oracle_kind": self.oracle_kind,
+            "oracle_source": self.oracle_source,
+            "target_file": self.target_file,
+            "target_symbol": self.target_symbol,
+            "target_binding_verified": self.target_binding_verified,
+            "oracle_binding_verified": self.oracle_binding_verified,
+            "target_intervention_verified": self.target_intervention_verified,
+            "target_intervention_repetitions": self.target_intervention_repetitions,
+            "corroboration_count": self.corroboration_count,
+            "change_coverage": self.change_coverage,
+            "environment_integrity": self.environment_integrity,
+        }
+
+
+@dataclass(frozen=True)
 class ProbeAssessment:
     """Complete differential evidence for one generated probe."""
 
@@ -217,6 +284,7 @@ class Finding:
     intent_match: bool | None = None
     triage_status: TriageStatus = TriageStatus.UNREVIEWED
     triage_reason: str = ""
+    evidence: EvidenceVector | None = None
 
     @property
     def should_gate(self) -> bool:
@@ -254,6 +322,7 @@ class Finding:
             "triage_status": self.triage_status.value,
             "triage_reason": self.triage_reason,
             "should_gate": self.should_gate,
+            "evidence": self.evidence.to_dict() if self.evidence is not None else None,
             "base_runs": [_record_to_dict(record) for record in self.base_runs],
             "candidate_runs": [_record_to_dict(record) for record in self.candidate_runs],
         }
@@ -281,6 +350,19 @@ class DifferentialRunResult:
     def gating_findings(self) -> tuple[Finding, ...]:
         return tuple(finding for finding in self.findings if finding.should_gate)
 
+    @property
+    def verdict(self) -> RunVerdict:
+        kinds = {assessment.classification.kind for assessment in self.assessments}
+        if ClassificationKind.INVALID in kinds:
+            return RunVerdict.INCOMPLETE
+        if self.gating_findings:
+            return RunVerdict.REGRESSION_FOUND
+        if ClassificationKind.STABLE_CHANGE in kinds:
+            return RunVerdict.CHANGE_OBSERVED
+        if self.assessments and kinds == {ClassificationKind.UNCHANGED}:
+            return RunVerdict.NO_DIFFERENTIAL_OBSERVED
+        return RunVerdict.INSUFFICIENT_EVIDENCE
+
     def to_dict(self) -> dict[str, object]:
         return {
             "run_id": self.run_id,
@@ -290,6 +372,7 @@ class DifferentialRunResult:
             "assessment_count": len(self.assessments),
             "stable_change_count": self.stable_change_count,
             "gating_finding_count": len(self.gating_findings),
+            "verdict": self.verdict.value,
             "assessments": [assessment.to_dict() for assessment in self.assessments],
             "findings": [finding.to_dict() for finding in self.findings],
         }

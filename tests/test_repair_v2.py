@@ -69,10 +69,12 @@ class RecordingFactory:
         *,
         suite_passes: bool = True,
         mutate_target: bool = False,
+        mutate_untracked_on_call: int | None = None,
         candidate_signature: str = "value-changed",
     ) -> None:
         self.suite_passes = suite_passes
         self.mutate_target = mutate_target
+        self.mutate_untracked_on_call = mutate_untracked_on_call
         self.candidate_signature = candidate_signature
         self.workspaces: list[Path] = []
         self.prepared_contents: list[str] = []
@@ -81,17 +83,20 @@ class RecordingFactory:
         self.runtimes: list[str | None] = []
         self.adapter_settings: list[Any] = []
         self.budgets: list[int] = []
+        self.calls = 0
 
     def __call__(self, _adapter, settings, _run_path, runtime, budget):
+        self.calls += 1
         self.runtimes.append(runtime)
         self.adapter_settings.append(settings)
         self.budgets.append(budget)
-        return RecordingExecutor(self)
+        return RecordingExecutor(self, self.calls)
 
 
 class RecordingExecutor:
-    def __init__(self, owner: RecordingFactory) -> None:
+    def __init__(self, owner: RecordingFactory, factory_call: int) -> None:
         self.owner = owner
+        self.factory_call = factory_call
         self.workspace: Path | None = None
 
     @property
@@ -120,6 +125,11 @@ class RecordingExecutor:
         if self.owner.mutate_target:
             (revision.workspace / "src" / "value.py").write_text(
                 "def value() -> int:\n    return 99\n",
+                encoding="utf-8",
+            )
+        if self.owner.mutate_untracked_on_call == self.factory_call:
+            (revision.workspace / "unexpected-validation-output.txt").write_text(
+                "unexpected\n",
                 encoding="utf-8",
             )
         if self.owner.suite_passes:
@@ -329,8 +339,12 @@ def test_verified_repair_emits_only_patch_and_preserves_checkout(tmp_path: Path)
     assert _git(repo, "rev-parse", "HEAD") == candidate
     assert _git(repo, "status", "--porcelain=v1") == before_status
     assert _git(repo, "worktree", "list", "--porcelain") == before_worktrees
-    assert factory.probe_repetitions == [3, 3]
-    assert factory.suite_argv == [("python", "-m", "pytest", "-q")]
+    assert factory.probe_repetitions == [3, 3, 3]
+    assert factory.suite_argv == [
+        ("python", "-m", "pytest", "-q"),
+        ("python", "-m", "pytest", "-q"),
+    ]
+    assert factory.prepared_contents == [BROKEN, FIXED, FIXED]
     assert factory.workspaces and all(not path.exists() for path in factory.workspaces)
     assert "../../outside.py" not in llm.prompts[0].split("Allowed repair paths:", 1)[1]
 
@@ -450,8 +464,8 @@ def test_failed_hypothesis_is_retried_in_a_fresh_candidate(tmp_path: Path) -> No
         executor_factory=factory,
     )
 
-    assert len(factory.workspaces) == 3
-    assert len(set(factory.workspaces)) == 3
+    assert len(factory.workspaces) == 4
+    assert len(set(factory.workspaces)) == 4
     assert all(not path.exists() for path in factory.workspaces)
     assert len(llm.prompts) == 2
     assert all("return 2" in prompt for prompt in llm.prompts)
@@ -631,9 +645,9 @@ def test_saved_suite_runtime_and_image_override_current_config(tmp_path: Path) -
         executor_factory=factory,
     )
 
-    assert factory.suite_argv == [recorded_suite]
-    assert factory.runtimes == ["podman", "podman"]
-    assert factory.probe_repetitions == [3, 3]
+    assert factory.suite_argv == [recorded_suite, recorded_suite]
+    assert factory.runtimes == ["podman", "podman", "podman"]
+    assert factory.probe_repetitions == [3, 3, 3]
     assert all(
         settings.image == "registry.example.test/python@sha256:" + "a" * 64
         and settings.setup_argv == ("python", "-m", "pip", "install", "-e", ".")
@@ -670,10 +684,10 @@ def test_builtin_repair_provider_uses_saved_remaining_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _repo, store, _base, _candidate = _saved_finding(tmp_path, recorded_budget=17)
-    observed: list[float] = []
+    observed: list[tuple[str, str, float]] = []
 
-    def fake_create_provider(_settings, *, timeout_seconds=120):
-        observed.append(timeout_seconds)
+    def fake_create_provider(settings, *, timeout_seconds=120):
+        observed.append((settings.kind, settings.model, timeout_seconds))
         return ReplyLLM(_proposal())
 
     monkeypatch.setattr(repair_module, "create_provider", fake_create_provider)
@@ -686,7 +700,24 @@ def test_builtin_repair_provider_uses_saved_remaining_budget(
     )
 
     assert len(observed) == 1
-    assert 0 < observed[0] <= 17
+    assert observed[0][0:2] == ("anthropic", "fixture")
+    assert 0 < observed[0][2] <= 17
+
+
+def test_repair_rejects_repository_provider_override(tmp_path: Path) -> None:
+    repo, store, _base, _candidate = _saved_finding(tmp_path)
+    config = repo / ".evalyn.yml"
+    config.write_text("version: 1\nprovider:\n  model: current-worktree-model\n")
+
+    with pytest.raises(RepairError, match="outside the repository"):
+        repair_saved_finding(
+            store,
+            FINDING_ID,
+            output_path=tmp_path / "repair.patch",
+            config_path=config,
+            llm=ReplyLLM(_proposal()),
+            executor_factory=RecordingFactory(),
+        )
 
 
 @pytest.mark.parametrize("budget", [None, 0, -1, True, "600"])
@@ -862,6 +893,27 @@ def test_validation_cannot_mutate_tracked_source_to_manufacture_success(
             max_attempts=1,
         )
 
+    assert not (tmp_path / "repair.patch").exists()
+
+
+def test_final_fresh_verification_rejects_untracked_validation_changes(
+    tmp_path: Path,
+) -> None:
+    _repo, store, _base, _candidate = _saved_finding(tmp_path)
+    factory = RecordingFactory(mutate_untracked_on_call=3)
+
+    with pytest.raises(RepairError, match="unexpected untracked"):
+        repair_saved_finding(
+            store,
+            FINDING_ID,
+            output_path=tmp_path / "repair.patch",
+            llm=ReplyLLM(_proposal()),
+            executor_factory=factory,
+            max_attempts=1,
+        )
+
+    assert factory.probe_repetitions == [3, 3, 3]
+    assert len(factory.suite_argv) == 2
     assert not (tmp_path / "repair.patch").exists()
 
 

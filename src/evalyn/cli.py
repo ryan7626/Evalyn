@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import subprocess
 import tempfile
 from contextlib import suppress
 from dataclasses import dataclass
@@ -19,7 +20,14 @@ from rich.table import Table
 
 from evalyn import __version__
 from evalyn.adapters.registry import default_registry
+from evalyn.artifacts import (
+    ArtifactExportError,
+    build_finding_bundle,
+    promote_finding_source,
+    write_bundle_exclusive,
+)
 from evalyn.execution import RuntimeUnavailableError, resolve_container_engine
+from evalyn.execution.git_safety import sanitized_git_command, sanitized_git_environment
 from evalyn.llm import create_provider
 from evalyn.operations import (
     OperationError,
@@ -32,8 +40,6 @@ from evalyn.run_store import RunStore
 from evalyn.settings import SettingsError, load_settings, render_default_config
 from evalyn.workflow import CheckError, CheckOptions, inspect_check, run_check
 
-load_dotenv()
-
 
 @dataclass(frozen=True)
 class CLIContext:
@@ -41,6 +47,7 @@ class CLIContext:
     config: Path | None
     state_root: Path | None
     console: Console
+    allow_remote_container: bool = False
 
 
 @click.group(context_settings={"help_option_names": ["-h", "--help"]})
@@ -54,7 +61,17 @@ class CLIContext:
     envvar="EVALYN_STATE_HOME",
     help="External Evalyn state/artifact root.",
 )
+@click.option(
+    "--env-file",
+    type=click.Path(path_type=Path, dir_okay=False, exists=True),
+    help="Explicit credential file outside the target repository.",
+)
 @click.option("--no-color", is_flag=True)
+@click.option(
+    "--allow-remote-container",
+    is_flag=True,
+    help="Explicitly permit a tcp:// or ssh:// OCI daemon endpoint for this invocation.",
+)
 @click.option("-v", "--verbose", count=True)
 @click.version_option(version=__version__, prog_name="evalyn")
 @click.pass_context
@@ -63,16 +80,21 @@ def main(
     repo: Path,
     config: Path | None,
     state_root: Path | None,
+    env_file: Path | None,
     no_color: bool,
+    allow_remote_container: bool,
     verbose: int,
 ) -> None:
     """Generate disposable tests for a Git diff and surface stable regressions."""
     logging.basicConfig(level=logging.DEBUG if verbose else logging.WARNING)
+    if env_file is not None:
+        _load_external_env_file(repo, env_file)
     ctx.obj = CLIContext(
         repo=repo.expanduser(),
         config=config.expanduser() if config else None,
         state_root=state_root.expanduser() if state_root else None,
         console=Console(color_system=None if no_color else "auto"),
+        allow_remote_container=allow_remote_container,
     )
 
 
@@ -110,36 +132,72 @@ def doctor(context: CLIContext, output_format: str, check_provider: bool) -> Non
     """Validate Git, configuration, adapters, runtime, and provider settings."""
     checks: list[dict[str, str]] = []
     failed = False
-    try:
-        repo = validate_git_repository(context.repo)
-        checks.append({"name": "git", "status": "ok", "detail": str(repo)})
-        settings = load_settings(repo, context.config)
-        checks.append({"name": "config", "status": "ok", "detail": "schema v1"})
-        adapters = default_registry().detect(repo)
-        failed = failed or not adapters
+    repo: Path | None = None
+    settings = None
+
+    def record(name: str, action) -> object | None:
+        nonlocal failed
+        try:
+            detail, value = action()
+        except Exception as exc:
+            failed = True
+            checks.append(
+                {"name": name, "status": "error", "detail": f"{type(exc).__name__}: {exc}"}
+            )
+            return None
+        checks.append({"name": name, "status": "ok", "detail": detail})
+        return value
+
+    repo_value = record(
+        "git",
+        lambda: (
+            str(validated := validate_git_repository(context.repo)),
+            validated,
+        ),
+    )
+    # Keep independent checks useful even when Git validation failed.
+    repo = repo_value if isinstance(repo_value, Path) else context.repo.expanduser().resolve()
+
+    settings = record(
+        "config",
+        lambda: ("schema v1", load_settings(repo, context.config)),
+    )
+    adapter_value = record(
+        "adapters",
+        lambda: _doctor_adapters(repo),
+    )
+    del adapter_value
+
+    preferred = None
+    if settings is not None:
+        preferred = None if settings.sandbox.runtime == "auto" else settings.sandbox.runtime
+    record(
+        "container",
+        lambda: (
+            str(engine := resolve_container_engine(preferred)),
+            engine,
+        ),
+    )
+
+    if settings is None:
         checks.append(
             {
-                "name": "adapters",
-                "status": "ok" if adapters else "error",
-                "detail": ", ".join(adapter.name for adapter in adapters) or "none detected",
+                "name": "provider",
+                "status": "skipped",
+                "detail": "configuration is unavailable",
             }
         )
-        preferred = None if settings.sandbox.runtime == "auto" else settings.sandbox.runtime
-        engine = resolve_container_engine(preferred)
-        checks.append({"name": "container", "status": "ok", "detail": engine})
-        provider_detail = f"{settings.provider.kind}/{settings.provider.model}"
-        if check_provider:
-            reply = create_provider(settings.provider).complete(
-                "This is a connectivity check. Reply with OK.", "OK", max_tokens=8
-            )
-            provider_detail += f" — replied {reply.strip()[:20]!r}"
-        else:
-            provider_detail += " — connectivity not requested"
-        checks.append({"name": "provider", "status": "ok", "detail": provider_detail})
-    except Exception as exc:
-        failed = True
+    elif check_provider:
+        record("provider", lambda: _doctor_provider(settings))
+    else:
         checks.append(
-            {"name": "doctor", "status": "error", "detail": f"{type(exc).__name__}: {exc}"}
+            {
+                "name": "provider",
+                "status": "not_checked",
+                "detail": (
+                    f"{settings.provider.kind}/{settings.provider.model} — use --check-provider"
+                ),
+            }
         )
     if output_format == "json":
         click.echo(json.dumps({"checks": checks, "ok": not failed}, indent=2))
@@ -149,7 +207,11 @@ def doctor(context: CLIContext, output_format: str, check_provider: bool) -> Non
         table.add_column("Status")
         table.add_column("Detail")
         for item in checks:
-            style = "green" if item["status"] == "ok" else "red"
+            style = (
+                "green"
+                if item["status"] == "ok"
+                else ("yellow" if item["status"] in {"skipped", "not_checked"} else "red")
+            )
             table.add_row(item["name"], f"[{style}]{item['status']}[/]", item["detail"])
         context.console.print(table)
     if failed:
@@ -236,6 +298,7 @@ def check(
         model=model,
         config_path=context.config,
         state_root=context.state_root,
+        allow_remote_container=context.allow_remote_container,
     )
     if dry_run:
         try:
@@ -249,14 +312,11 @@ def check(
             "adapters": list(inspection.adapters),
             "changed_files": list(inspection.changed_files),
         }
-        if output_format == "json":
-            click.echo(json.dumps(payload, indent=2))
-        else:
-            context.console.print("[bold]Evalyn dry run[/]")
-            context.console.print(f"Base:      {payload['base']}")
-            context.console.print(f"Candidate: {payload['candidate']}")
-            context.console.print(f"Adapters:  {', '.join(payload['adapters'])}")
-            context.console.print(f"Files:     {len(payload['changed_files'])}")
+        try:
+            _emit_dry_run(context, payload, output_format, output)
+        except (OSError, ValueError) as exc:
+            context.console.print(f"[red]Incomplete:[/] Could not emit dry-run output: {exc}")
+            raise SystemExit(3) from None
         return
     try:
         outcome = run_check(options)
@@ -357,6 +417,7 @@ def reproduce(
             side=side,
             repeat=repeat,
             runtime=runtime,
+            allow_remote_endpoint=context.allow_remote_container,
         )
     except (RevisionError, OperationError, RuntimeUnavailableError, ValueError) as exc:
         context.console.print(f"[red]Incomplete:[/] {exc}")
@@ -368,6 +429,11 @@ def reproduce(
         context.console.print(
             "Candidate: " + ", ".join(item.status.value for item in result.candidate)
         )
+    context.console.print(f"Verdict:   {result.verdict}")
+    if result.incomplete:
+        raise SystemExit(3)
+    if not result.reproduced:
+        raise SystemExit(1)
 
 
 @main.command()
@@ -413,6 +479,65 @@ def triage(
 
 @main.command()
 @click.argument("finding_id")
+@click.option(
+    "--output",
+    type=click.Path(path_type=Path, dir_okay=False),
+    required=True,
+    help="New .zip path inside the target repository.",
+)
+@click.pass_obj
+def bundle(context: CLIContext, finding_id: str, output: Path) -> None:
+    """Export one finding as a deterministic, integrity-manifested ZIP."""
+    try:
+        finding_id = validate_finding_id(finding_id)
+    except OperationError as exc:
+        _usage_error(context, str(exc))
+    try:
+        repo = validate_git_repository(context.repo)
+        destination = _resolve_output_destination(repo, output)
+        if destination.suffix.casefold() != ".zip":
+            raise ArtifactExportError("Evidence bundle output must use a .zip extension")
+        payload = build_finding_bundle(RunStore(repo, context.state_root), finding_id)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination = _resolve_output_destination(repo, destination)
+        write_bundle_exclusive(destination, payload)
+    except (RevisionError, OperationError, ArtifactExportError, OSError, ValueError) as exc:
+        context.console.print(f"[red]Bundle not emitted:[/] {exc}")
+        raise SystemExit(3) from None
+    context.console.print(f"[green]Evidence bundle:[/] {destination}")
+
+
+@main.command()
+@click.argument("finding_id")
+@click.option(
+    "--output",
+    type=click.Path(path_type=Path, dir_okay=False),
+    required=True,
+    help="New permanent test path inside the target repository.",
+)
+@click.pass_obj
+def promote(context: CLIContext, finding_id: str, output: Path) -> None:
+    """Promote a maintainer-confirmed generated probe to a normal test."""
+    try:
+        finding_id = validate_finding_id(finding_id)
+    except OperationError as exc:
+        _usage_error(context, str(exc))
+    try:
+        repo = validate_git_repository(context.repo)
+        destination = _resolve_output_destination(repo, output)
+        promoted = promote_finding_source(
+            RunStore(repo, context.state_root),
+            finding_id,
+            destination,
+        )
+    except (RevisionError, OperationError, ArtifactExportError, OSError, ValueError) as exc:
+        context.console.print(f"[red]Test not promoted:[/] {exc}")
+        raise SystemExit(3) from None
+    context.console.print(f"[green]Promoted test:[/] {promoted}")
+
+
+@main.command()
+@click.argument("finding_id")
 @click.option("--emit-patch", type=click.Path(path_type=Path, dir_okay=False), required=True)
 @click.option("--runtime", type=click.Choice(["docker", "podman"]))
 @click.pass_obj
@@ -432,6 +557,7 @@ def repair(context: CLIContext, finding_id: str, emit_patch: Path, runtime: str 
             output_path=emit_patch,
             runtime=runtime,
             config_path=context.config,
+            allow_remote_endpoint=context.allow_remote_container,
         )
     except (RevisionError, RepairError, ValueError) as exc:
         context.console.print(f"[red]Repair not emitted:[/] {exc}")
@@ -499,6 +625,82 @@ def demo(context: CLIContext) -> None:
     context.console.print(f"\nArtifacts: {result.run_path}")
 
 
+def _doctor_adapters(repo: Path) -> tuple[str, tuple[object, ...]]:
+    adapters = tuple(default_registry().detect(repo))
+    if not adapters:
+        raise RuntimeError("no pytest or Vitest adapter detected")
+    return ", ".join(adapter.name for adapter in adapters), adapters
+
+
+def _doctor_provider(settings) -> tuple[str, object]:
+    reply = create_provider(settings.provider).complete(
+        "This is a connectivity check. Reply with OK.", "OK", max_tokens=8
+    )
+    detail = f"{settings.provider.kind}/{settings.provider.model} — replied {reply.strip()[:20]!r}"
+    return detail, reply
+
+
+def _emit_dry_run(
+    context: CLIContext,
+    payload: dict[str, object],
+    output_format: str,
+    output: Path | None,
+) -> None:
+    if output_format == "json":
+        rendered = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    elif output_format == "sarif":
+        rendered = (
+            json.dumps(
+                {
+                    "version": "2.1.0",
+                    "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+                    "runs": [
+                        {
+                            "tool": {"driver": {"name": "Evalyn dry run"}},
+                            "invocations": [
+                                {
+                                    "executionSuccessful": True,
+                                    "properties": payload,
+                                }
+                            ],
+                            "results": [],
+                        }
+                    ],
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n"
+        )
+    else:
+        changed_files = payload["changed_files"]
+        assert isinstance(changed_files, list)
+        adapters = payload["adapters"]
+        assert isinstance(adapters, list)
+        lines = [
+            "# Evalyn dry run",
+            "",
+            f"- Base: `{payload['base']}`",
+            f"- Candidate: `{payload['candidate']}`",
+            f"- Dirty overlay: `{str(payload['dirty']).lower()}`",
+            f"- Adapters: {', '.join(str(item) for item in adapters) or 'none'}",
+            f"- Changed files: {len(changed_files)}",
+            "",
+        ]
+        lines.extend(f"  - `{path}`" for path in changed_files)
+        rendered = "\n".join(lines) + "\n"
+
+    if output is not None:
+        destination = _resolve_output_destination(context.repo, output)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination = _resolve_output_destination(context.repo, destination)
+        _copy_file_atomically(rendered.encode("utf-8"), destination)
+    if output_format == "console":
+        context.console.print(Markdown(rendered))
+    else:
+        click.echo(rendered, nl=False)
+
+
 def _emit_check_output(
     context: CLIContext, outcome, output_format: str, output: Path | None
 ) -> None:
@@ -553,10 +755,12 @@ def _resolve_output_destination(repo_path: Path, output: Path) -> Path:
         raise ValueError(f"{kind} output must resolve inside the target repository") from exc
     if not relative.parts or relative.parts[0].casefold() == ".git":
         raise ValueError("output cannot target the repository root or Git metadata")
-    if destination.exists() and not destination.is_file():
-        raise ValueError("output destination must name a regular file")
+    if destination.exists():
+        raise ValueError("output destination already exists; Evalyn will not overwrite it")
     if destination.parent.exists() and not destination.parent.is_dir():
         raise ValueError("output parent must be a directory")
+    if _is_tracked_output(repo, relative.as_posix()):
+        raise ValueError("output cannot target a tracked repository path")
     return destination
 
 
@@ -578,7 +782,10 @@ def _copy_file_atomically(payload: bytes, destination: Path) -> None:
             writer.write(payload)
             writer.flush()
             os.fsync(writer.fileno())
-        temporary.replace(destination)
+        # A hard-link publishes the fully flushed temporary inode while failing
+        # atomically if another process created the destination after validation.
+        os.link(temporary, destination, follow_symlinks=False)
+        temporary.unlink()
     except BaseException:
         with suppress(OSError):
             os.close(descriptor)
@@ -586,8 +793,46 @@ def _copy_file_atomically(payload: bytes, destination: Path) -> None:
         raise
 
 
+def _is_tracked_output(repo: Path, relative: str) -> bool:
+    try:
+        completed = subprocess.run(
+            sanitized_git_command(repo, "ls-files", "--", relative),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            env=sanitized_git_environment(),
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ValueError(f"could not verify whether output is tracked: {exc}") from exc
+    if completed.returncode != 0:
+        detail = completed.stderr.decode("utf-8", errors="replace").strip()
+        raise ValueError(
+            "could not verify whether output is tracked" + (f": {detail}" if detail else "")
+        )
+    return bool(completed.stdout.strip())
+
+
+def _load_external_env_file(repo_path: Path, env_file: Path) -> None:
+    try:
+        repo = repo_path.expanduser().resolve(strict=True)
+        if env_file.is_symlink():
+            raise click.BadParameter("--env-file cannot be a symlink")
+        resolved = env_file.expanduser().resolve(strict=True)
+        if resolved.is_relative_to(repo):
+            raise click.BadParameter("--env-file must be outside the target repository")
+    except click.BadParameter:
+        raise
+    except (OSError, ValueError) as exc:
+        raise click.BadParameter(f"Could not validate --env-file: {exc}") from exc
+    load_dotenv(resolved, override=False)
+
+
 def _emit_value(context: CLIContext, value: dict, output_format: str) -> None:
-    if output_format in {"json", "sarif"}:
+    if output_format == "sarif":
+        click.echo(json.dumps(_stored_finding_sarif(value), indent=2))
+        return
+    if output_format == "json":
         click.echo(json.dumps(value, indent=2))
         return
     rendered = "\n".join(
@@ -605,6 +850,59 @@ def _emit_value(context: CLIContext, value: dict, output_format: str) -> None:
     context.console.print(Markdown(rendered)) if output_format == "console" else click.echo(
         rendered
     )
+
+
+def _stored_finding_sarif(finding: dict) -> dict[str, object]:
+    """Render one stored finding as an actual SARIF log for ``show``."""
+    should_gate = finding.get("should_gate") is True
+    semantic_state = str(finding.get("semantic_state", "uncertain_change"))
+    triage_status = str(finding.get("triage_status", "unreviewed"))
+    level = (
+        "error"
+        if should_gate
+        else (
+            "note"
+            if triage_status == "dismissed" or semantic_state == "intended_change"
+            else "warning"
+        )
+    )
+    rule_id = "evalyn/likely-regression" if should_gate else "evalyn/behavior-change"
+    result: dict[str, object] = {
+        "ruleId": rule_id,
+        "level": level,
+        "message": {"text": f"{finding.get('title', '')} ({finding.get('finding_id', 'unknown')})"},
+        "properties": {
+            "findingId": finding.get("finding_id", ""),
+            "semanticState": semantic_state,
+            "oracleProvenance": finding.get("oracle_provenance", ""),
+            "triageStatus": triage_status,
+            "evidence": finding.get("evidence"),
+        },
+    }
+    metadata = finding.get("probe_metadata")
+    changed_file = metadata.get("changed_file") if isinstance(metadata, dict) else None
+    if isinstance(changed_file, str) and changed_file:
+        result["locations"] = [{"physicalLocation": {"artifactLocation": {"uri": changed_file}}}]
+    return {
+        "version": "2.1.0",
+        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+        "runs": [
+            {
+                "tool": {
+                    "driver": {
+                        "name": "Evalyn",
+                        "rules": [
+                            {
+                                "id": rule_id,
+                                "shortDescription": {"text": "Evalyn differential finding"},
+                            }
+                        ],
+                    }
+                },
+                "results": [result],
+            }
+        ],
+    }
 
 
 def _usage_error(context: CLIContext, message: str) -> None:

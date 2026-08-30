@@ -10,7 +10,7 @@ import pytest
 
 import evalyn.execution.git_safety as git_safety
 from evalyn.execution.bounded import BoundedProcessResult
-from evalyn.execution.git_safety import UnsafeGitConfiguration
+from evalyn.execution.git_safety import UnsafeGitConfiguration, sanitized_git_environment
 from evalyn.revisions import get_diff, is_dirty, resolve_range
 
 
@@ -22,6 +22,31 @@ def _git(repo: Path, *args: str) -> str:
         check=True,
     )
     return completed.stdout.strip()
+
+
+def test_sanitized_git_environment_disables_replacement_objects() -> None:
+    assert sanitized_git_environment()["GIT_NO_REPLACE_OBJECTS"] == "1"
+
+
+def test_read_only_git_inspection_ignores_replacement_refs(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-b", "main")
+    _git(repo, "config", "user.email", "evalyn@example.test")
+    _git(repo, "config", "user.name", "Evalyn Test")
+    (repo / "value.txt").write_text("base\n", encoding="utf-8")
+    _git(repo, "add", "value.txt")
+    _git(repo, "commit", "-m", "base")
+    base_sha = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "checkout", "-b", "feature")
+    (repo / "value.txt").write_text("candidate\n", encoding="utf-8")
+    _git(repo, "commit", "-am", "candidate")
+    revisions = resolve_range(repo, "main...HEAD")
+    _git(repo, "replace", revisions.candidate_sha, base_sha)
+
+    diff = get_diff(repo, revisions)
+
+    assert "+candidate" in diff
 
 
 def test_read_only_git_inspection_neutralizes_filters_and_textconv(tmp_path: Path) -> None:
