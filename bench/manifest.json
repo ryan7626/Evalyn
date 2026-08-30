@@ -1,12 +1,40 @@
 {
-  "schema_version": 1,
-  "description": "Causal base-pass, buggy-fail, fixed-pass fixtures for Evalyn adapters.",
+  "schema_version": 2,
+  "description": "Deterministic execution smoke cases plus reviewed end-to-end detector scoring cases.",
+  "scoring_protocol": {
+    "trials_per_case": 3,
+    "portfolio_k": 8,
+    "repetitions_per_finding": 3,
+    "required_fingerprints": [
+      "provider",
+      "model",
+      "prompt_sha256",
+      "environment_sha256"
+    ],
+    "thresholds": {
+      "probe_validity_rate_min": 0.85,
+      "positive_discovery_pass_at_k_min": 0.4,
+      "false_gate_rate_max": 0.05,
+      "automatic_gate_precision_min": 0.9,
+      "reproduction_rate_min": 0.95,
+      "latency_p50_seconds_max": 300,
+      "latency_p95_seconds_max": 720
+    }
+  },
   "promotion_gate": {
-    "target_cases": 60,
-    "implemented_cases": 2,
+    "target_scoring_cases": 60,
+    "target_positive_cases": 30,
+    "target_negative_cases": 30,
+    "target_pytest_cases": 30,
+    "target_vitest_cases": 30,
+    "registered_scoring_cases": 0,
+    "registered_positive_cases": 0,
+    "registered_negative_cases": 0,
+    "registered_pytest_cases": 0,
+    "registered_vitest_cases": 0,
     "met": false
   },
-  "cases": [
+  "smoke_cases": [
     {
       "id": "pytest-discount-rounding",
       "framework": "pytest",
@@ -57,5 +85,6 @@
       },
       "repetitions": 3
     }
-  ]
+  ],
+  "scoring_cases": []
 }
