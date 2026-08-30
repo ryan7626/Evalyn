@@ -39,11 +39,32 @@ inputs:
     default: "3.12"
 
 outputs:
+  run-id:
+    description: ID of the newly created Evalyn run, or empty when no run was created
+    value: ${{ steps.check.outputs.run-id }}
+  verdict:
+    description: Evidence verdict, or not_run/unknown when no trustworthy run verdict is available
+    value: ${{ steps.check.outputs.verdict }}
+  run-status:
+    description: Stored run status (complete or incomplete), or empty when no run was created
+    value: ${{ steps.check.outputs.run-status }}
+  report:
+    description: Absolute path to the run-owned Markdown report, or empty when unavailable
+    value: ${{ steps.check.outputs.report }}
+  manifest:
+    description: Absolute path to the validated run manifest, or empty when unavailable
+    value: ${{ steps.check.outputs.manifest }}
   sarif:
-    description: Absolute path to the generated SARIF file
+    description: Absolute path to a verified regular SARIF file, or empty when unavailable
     value: ${{ steps.check.outputs.sarif }}
+  finding-count:
+    description: Number of stable findings recorded by the run, or empty when unavailable
+    value: ${{ steps.check.outputs.finding-count }}
+  gating-finding-count:
+    description: Number of findings admitted by the run's policy gate, or empty when unavailable
+    value: ${{ steps.check.outputs.gating-finding-count }}
   exit-code:
-    description: Evalyn exit code (0 clear, 1 finding, 2 usage, 3 incomplete)
+    description: Evalyn exit code (0 completed, 1 policy gate, 2 usage, 3 incomplete)
     value: ${{ steps.check.outputs.exit-code }}
 
 runs:
@@ -54,6 +75,7 @@ runs:
       with:
         python-version: ${{ inputs.python-version }}
         cache: pip
+        cache-dependency-path: ${{ github.action_path }}/pyproject.toml
 
     - name: Install this Evalyn checkout
       shell: bash
@@ -72,9 +94,45 @@ runs:
         EVALYN_ACTION_RUNTIME: ${{ inputs.runtime }}
         EVALYN_ACTION_STATE_ROOT: ${{ inputs.state-root }}
       run: |
-        if [[ -z "$EVALYN_ACTION_RANGE" ]]; then
-          echo "The range input must be BASE...CANDIDATE." >&2
+        set -euo pipefail
+
+        emit_usage_error() {
+          local detail="$1"
+          {
+            printf '%s\n' 'run-id='
+            printf '%s\n' 'verdict=not_run'
+            printf '%s\n' 'run-status='
+            printf '%s\n' 'report='
+            printf '%s\n' 'manifest='
+            printf '%s\n' 'sarif='
+            printf '%s\n' 'finding-count='
+            printf '%s\n' 'gating-finding-count='
+            printf '%s\n' 'exit-code=2'
+          } >> "$GITHUB_OUTPUT"
+          if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+            {
+              printf '%s\n\n' '## Evalyn differential check'
+              printf '%s\n' '| Field | Value |'
+              printf '%s\n' '| --- | --- |'
+              printf '%s\n' '| Exit | `2 — usage or configuration error` |'
+              printf '%s\n' '| Verdict | `not_run` |'
+              printf '%s\n' '| Run | `not available` |'
+              printf '%s\n' '' 'This result is not evidence that the candidate is regression-free.'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "$detail" >&2
           exit 2
+        }
+
+        if [[ -z "$EVALYN_ACTION_RANGE" || "$EVALYN_ACTION_RANGE" == *$'\n'* || "$EVALYN_ACTION_RANGE" == *$'\r'* ]]; then
+          emit_usage_error "The range input must be BASE...CANDIDATE."
+        fi
+
+        if [[ "$EVALYN_ACTION_OUTPUT" == *$'\n'* || "$EVALYN_ACTION_OUTPUT" == *$'\r'* ]]; then
+          emit_usage_error "The output input cannot contain line breaks."
+        fi
+        if [[ "$EVALYN_ACTION_STATE_ROOT" == *$'\n'* || "$EVALYN_ACTION_STATE_ROOT" == *$'\r'* ]]; then
+          emit_usage_error "The state-root input cannot contain line breaks."
         fi
 
         output_path="$EVALYN_ACTION_OUTPUT"
@@ -85,14 +143,49 @@ runs:
         if [[ -z "$state_root" ]]; then
           state_root="$RUNNER_TEMP/evalyn-state"
         elif [[ "$state_root" != /* ]]; then
-          state_root="$RUNNER_TEMP/$state_root"
+          if ! state_root="$(python - "$RUNNER_TEMP" "$state_root" <<'PY'
+        from pathlib import Path
+        import sys
+
+        temporary_root = Path(sys.argv[1]).resolve()
+        requested = (temporary_root / sys.argv[2]).resolve()
+        try:
+            requested.relative_to(temporary_root)
+        except ValueError:
+            raise SystemExit("A relative state-root must remain beneath RUNNER_TEMP.")
+        print(requested)
+        PY
+          )"; then
+            emit_usage_error "The relative state-root is outside RUNNER_TEMP."
+          fi
         fi
+
+        run_snapshot="$(mktemp "$RUNNER_TEMP/evalyn-runs.XXXXXX")"
+        trap 'rm -f -- "$run_snapshot"' EXIT
+        python - "$GITHUB_WORKSPACE" "$state_root" "$run_snapshot" <<'PY'
+        import json
+        from pathlib import Path
+        import sys
+
+        from evalyn.run_store import RunStore
+
+        destination = Path(sys.argv[3])
+        try:
+            run_ids = [
+                run.run_id
+                for run in RunStore(Path(sys.argv[1]), Path(sys.argv[2])).list_runs(limit=1000)
+            ]
+            snapshot = {"ok": True, "run_ids": run_ids}
+        except (OSError, ValueError):
+            snapshot = {"ok": False, "run_ids": []}
+        destination.write_text(json.dumps(snapshot), encoding="utf-8")
+        PY
 
         args=(
           evalyn
           --repo "$GITHUB_WORKSPACE"
           --state-root "$state_root"
-          check "$EVALYN_ACTION_RANGE"
+          check
           --runtime "$EVALYN_ACTION_RUNTIME"
           --provider "$EVALYN_ACTION_PROVIDER"
           --fail-on "$EVALYN_ACTION_FAIL_ON"
@@ -105,11 +198,211 @@ runs:
         if [[ -n "$EVALYN_ACTION_MODEL" ]]; then
           args+=(--model "$EVALYN_ACTION_MODEL")
         fi
+        # Terminate option parsing before the untrusted positional range. Inputs
+        # such as --help or --dry-run must be treated as invalid revisions, never
+        # as control flags that can turn a no-op into a successful check.
+        args+=(-- "$EVALYN_ACTION_RANGE")
 
         set +e
         "${args[@]}"
         status=$?
         set -e
-        echo "sarif=$output_path" >> "$GITHUB_OUTPUT"
-        echo "exit-code=$status" >> "$GITHUB_OUTPUT"
+
+        export EVALYN_ACTION_RESOLVED_OUTPUT="$output_path"
+        export EVALYN_ACTION_RESOLVED_STATE_ROOT="$state_root"
+        export EVALYN_ACTION_STATUS="$status"
+        set +e
+        python - "$run_snapshot" <<'PY'
+        import hashlib
+        import json
+        import os
+        from pathlib import Path
+        import re
+        import stat
+        import sys
+
+        from evalyn.run_store import RunStore
+
+        status = int(os.environ["EVALYN_ACTION_STATUS"])
+        repository = Path(os.environ["GITHUB_WORKSPACE"])
+        state_root = Path(os.environ["EVALYN_ACTION_RESOLVED_STATE_ROOT"])
+        published_sarif = Path(os.environ["EVALYN_ACTION_RESOLVED_OUTPUT"])
+        snapshot = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+        snapshot_ok = isinstance(snapshot, dict) and snapshot.get("ok") is True
+        previous = set(snapshot.get("run_ids", ())) if snapshot_ok else set()
+
+        try:
+            store = RunStore(repository, state_root)
+            new_runs = (
+                [run for run in store.list_runs(limit=1000) if run.run_id not in previous]
+                if snapshot_ok
+                else []
+            )
+        except (OSError, ValueError):
+            new_runs = []
+
+        # Multiple new runs make attribution ambiguous. Never attach evidence from
+        # a run that this Action cannot uniquely identify as its own.
+        run = new_runs[0] if len(new_runs) == 1 else None
+
+        def regular_file(path: Path, *, beneath: Path) -> str:
+            try:
+                metadata = path.stat(follow_symlinks=False)
+                if not stat.S_ISREG(metadata.st_mode):
+                    return ""
+                resolved = path.resolve(strict=True)
+                resolved.relative_to(beneath.resolve(strict=True))
+            except (OSError, RuntimeError):
+                return ""
+            except ValueError:
+                return ""
+            value = str(resolved)
+            return "" if "\n" in value or "\r" in value else value
+
+        run_id = ""
+        run_status = ""
+        verdict = "not_run" if status == 2 else ("incomplete" if status == 3 else "unknown")
+        report = ""
+        internal_sarif = ""
+        finding_count = ""
+        gating_finding_count = ""
+        manifest_path = ""
+
+        if run is not None and re.fullmatch(r"[A-Za-z0-9._-]+", run.run_id):
+            run_id = run.run_id
+            manifest = run.manifest
+            candidate_status = manifest.get("status")
+            if candidate_status in {"complete", "incomplete"}:
+                run_status = candidate_status
+            candidate_verdict = manifest.get("verdict")
+            if candidate_verdict in {
+                "regression_found",
+                "change_observed",
+                "no_differential_observed",
+                "insufficient_evidence",
+                "incomplete",
+            }:
+                verdict = candidate_verdict
+            elif run_status == "incomplete":
+                verdict = "incomplete"
+            report = regular_file(run.path / "report.md", beneath=run.path)
+            internal_sarif = regular_file(run.path / "evalyn.sarif", beneath=run.path)
+            manifest_path = regular_file(run.path / "manifest.json", beneath=run.path)
+            for key, target in (
+                ("finding_count", "finding_count"),
+                ("gating_finding_count", "gating_finding_count"),
+            ):
+                value = manifest.get(key)
+                if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                    if target == "finding_count":
+                        finding_count = str(value)
+                    else:
+                        gating_finding_count = str(value)
+
+        published_sarif_path = regular_file(published_sarif, beneath=repository) if run else ""
+
+        def digest(path: str) -> str:
+            hasher = hashlib.sha256()
+            with Path(path).open("rb") as stream:
+                for block in iter(lambda: stream.read(1024 * 1024), b""):
+                    hasher.update(block)
+            return hasher.hexdigest()
+
+        sarif = internal_sarif
+        if published_sarif_path and internal_sarif:
+            try:
+                if digest(published_sarif_path) == digest(internal_sarif):
+                    sarif = published_sarif_path
+            except OSError:
+                sarif = internal_sarif
+        values = {
+            "run-id": run_id,
+            "verdict": verdict,
+            "run-status": run_status,
+            "report": report,
+            "manifest": manifest_path,
+            "sarif": sarif,
+            "finding-count": finding_count,
+            "gating-finding-count": gating_finding_count,
+            "exit-code": str(status),
+        }
+        output_file = Path(os.environ["GITHUB_OUTPUT"])
+        with output_file.open("a", encoding="utf-8") as stream:
+            for key, value in values.items():
+                if "\n" in value or "\r" in value:
+                    value = ""
+                stream.write(f"{key}={value}\n")
+
+        summary_file = os.environ.get("GITHUB_STEP_SUMMARY")
+        if summary_file:
+            meanings = {
+                0: "completed",
+                1: "policy gate triggered",
+                2: "usage or configuration error",
+                3: "incomplete evidence",
+            }
+
+            def markdown(value: str) -> str:
+                return value.replace("\\", "\\\\").replace("`", "\\`").replace("|", "\\|")
+
+            rows = [
+                ("Exit", f"{status} — {meanings.get(status, 'unexpected exit') }"),
+                ("Verdict", verdict),
+                ("Run", run_id or "not available"),
+            ]
+            if run_status:
+                rows.append(("Run status", run_status))
+            if finding_count:
+                rows.append(("Findings", finding_count))
+            if gating_finding_count:
+                rows.append(("Gating findings", gating_finding_count))
+            if report:
+                rows.append(("Markdown report", report))
+            if sarif:
+                rows.append(("SARIF", sarif))
+            if manifest_path:
+                rows.append(("Run manifest", manifest_path))
+
+            with Path(summary_file).open("a", encoding="utf-8") as stream:
+                stream.write("## Evalyn differential check\n\n")
+                stream.write("| Field | Value |\n| --- | --- |\n")
+                for label, value in rows:
+                    stream.write(f"| {label} | `{markdown(value)}` |\n")
+                if verdict in {
+                    "change_observed",
+                    "incomplete",
+                    "insufficient_evidence",
+                    "no_differential_observed",
+                    "unknown",
+                    "not_run",
+                }:
+                    stream.write("\nThis result is not evidence that the candidate is regression-free.\n")
+        PY
+        postprocess_status=$?
+
+        if [[ "$postprocess_status" -ne 0 ]]; then
+          fallback_verdict=unknown
+          if [[ "$status" -eq 2 ]]; then
+            fallback_verdict=not_run
+          elif [[ "$status" -eq 3 ]]; then
+            fallback_verdict=incomplete
+          fi
+          {
+            printf '%s\n' 'run-id='
+            printf 'verdict=%s\n' "$fallback_verdict"
+            printf '%s\n' 'run-status='
+            printf '%s\n' 'report='
+            printf '%s\n' 'manifest='
+            printf '%s\n' 'sarif='
+            printf '%s\n' 'finding-count='
+            printf '%s\n' 'gating-finding-count='
+            printf 'exit-code=%s\n' "$status"
+          } >> "$GITHUB_OUTPUT"
+          if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+            printf '\nEvalyn preserved exit `%s`, but Action metadata extraction was incomplete.\n' \
+              "$status" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "Evalyn Action metadata extraction was incomplete." >&2
+        fi
+
         exit "$status"
